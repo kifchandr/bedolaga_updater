@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+#
+# Bedolaga Bot — поэтапное обновление (staged upgrade)
+# Репозиторий: https://github.com/BEDOLAGA-DEV/remnawave-bedolaga-telegram-bot
+#
+# Запуск прямо с GitHub (после того как зальёте скрипт в свой репозиторий/gist):
+#   bash <(curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/upgrade.sh)
+# или:
+#   curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/upgrade.sh | bash
+#
+# Что делает:
+#   1. Сам находит папку бота (по label запущенного контейнера remnawave_bot или по CWD).
+#   2. Определяет текущую версию (из .release-please-manifest.json / pyproject / git-тега).
+#   3. Проверяет свободное место на диске перед стартом.
+#   4. Делает бэкап БД (pg_dump -Fc) в начале и далее каждые N версий (по умолчанию 5).
+#   5. Поэтапно (тег за тегом) обновляется до последней версии, ждёт healthcheck.
+#   6. Если рядом с ботом есть папка cabinet и бот доведён до последней версии — обновляет её.
+#   7. Чистит неиспользуемые docker-образы и показывает, как смотреть логи.
+#
+# Переменные окружения (все опциональны):
+#   BOT_DIR=/path/to/bot     — принудительно указать папку бота
+#   CABINET_DIR=/path         — принудительно указать папку кабинета
+#   TARGET_VERSION=3.60.0     — обновляться не до последней, а до конкретной версии
+#   PG_USER / PG_DB / PG_CONTAINER — переопределить параметры БД
+#   BACKUP_RETENTION=10       — сколько последних бэкапов хранить (0 = не чистить)
+#   BACKUP_EVERY=5            — делать бэкап каждые N версий (кроме обязательного в начале)
+#   MIN_FREE_MB=3000         — минимум свободного места (МБ), иначе стоп
+#   PRUNE_IMAGES=1           — чистить неиспользуемые образы в конце (0 = не чистить)
+#   NO_CONFIRM=1              — не спрашивать подтверждение
+#   SKIP_BACKUP=1            — пропустить бэкапы (НЕ рекомендуется)
+#   DRY_RUN=1                — только показать план, ничего не менять
+
+set -uo pipefail
+
+# ------------------------------------------------------------------ оформление
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'
+  C_YEL=$'\033[33m'; C_BLU=$'\033[36m'; C_BOLD=$'\033[1m'
+else
+  C_RESET=; C_RED=; C_GRN=; C_YEL=; C_BLU=; C_BOLD=
+fi
+
+info()  { echo "${C_BLU}ℹ️  $*${C_RESET}"; }
+ok()    { echo "${C_GRN}✅ $*${C_RESET}"; }
+warn()  { echo "${C_YEL}⚠️  $*${C_RESET}" >&2; }
+err()   { echo "${C_RED}❌ $*${C_RESET}" >&2; }
+step()  { echo; echo "${C_BOLD}==============================${C_RESET}";
+          echo "${C_BOLD}$*${C_RESET}";
+          echo "${C_BOLD}==============================${C_RESET}"; }
+die()   { err "$*"; exit 1; }
+
+# Чтение ввода даже когда скрипт запущен через `curl | bash` (stdin занят пайпом)
+ask() {  # ask "Вопрос: " VARNAME
+  local prompt="$1" __var="$2" __ans=""
+  if [ -r /dev/tty ]; then read -r -p "$prompt" __ans < /dev/tty
+  else read -r -p "$prompt" __ans; fi
+  printf -v "$__var" '%s' "$__ans"
+}
+confirm() {  # confirm "Продолжить?"
+  [ "${NO_CONFIRM:-0}" = "1" ] && return 0
+  local a=""; ask "$1 [y/N]: " a
+  case "$a" in [yYдД]*) return 0;; *) return 1;; esac
+}
+
+# ------------------------------------------------------------------ окружение
+DRY_RUN="${DRY_RUN:-0}"
+SKIP_BACKUP="${SKIP_BACKUP:-0}"
+BACKUP_RETENTION="${BACKUP_RETENTION:-10}"
+BACKUP_EVERY="${BACKUP_EVERY:-5}"      # делать бэкап каждые N устанавливаемых версий
+MIN_FREE_MB="${MIN_FREE_MB:-3000}"     # минимум свободного места (МБ) для старта
+PRUNE_IMAGES="${PRUNE_IMAGES:-1}"      # чистить неиспользуемые образы в конце
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Не найдена команда: $1"; }
+need_cmd git
+need_cmd docker
+
+# docker compose v2 или docker-compose v1
+if docker compose version >/dev/null 2>&1; then
+  DC() { docker compose "$@"; }
+elif command -v docker-compose >/dev/null 2>&1; then
+  DC() { docker-compose "$@"; }
+else
+  die "Не найден docker compose (ни 'docker compose', ни 'docker-compose')"
+fi
+
+docker info >/dev/null 2>&1 || die "Docker недоступен. Запустите скрипт от root или добавьте пользователя в группу docker."
+
+BOT_CONTAINER="remnawave_bot"
+
+# ------------------------------------------------------------ поиск папки бота
+detect_bot_dir() {
+  # 1) Явно задано
+  if [ -n "${BOT_DIR:-}" ]; then echo "$BOT_DIR"; return; fi
+  # 2) По label запущенного контейнера (самый надёжный способ)
+  local d
+  d=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' \
+        "$BOT_CONTAINER" 2>/dev/null)
+  if [ -n "$d" ] && [ -d "$d" ]; then echo "$d"; return; fi
+  # 3) Текущая директория, если похожа на бота
+  if [ -f "./docker-compose.yml" ] && [ -d "./.git" ]; then echo "$PWD"; return; fi
+  # 4) Спросить
+  local ans=""
+  warn "Не удалось автоматически определить папку бота."
+  ask "Укажите полный путь к папке бота: " ans
+  echo "$ans"
+}
+
+BOT_DIR="$(detect_bot_dir)"
+[ -d "$BOT_DIR" ] || die "Папка бота не найдена: $BOT_DIR"
+BOT_DIR="$(cd "$BOT_DIR" && pwd)"
+[ -d "$BOT_DIR/.git" ] || die "В $BOT_DIR нет git-репозитория — поэтапное обновление невозможно."
+info "Папка бота: ${C_BOLD}$BOT_DIR${C_RESET}"
+
+cd "$BOT_DIR" || die "Не удалось перейти в $BOT_DIR"
+# git иногда ругается на 'dubious ownership', когда владелец каталога отличается
+git config --global --add safe.directory "$BOT_DIR" 2>/dev/null || true
+
+ENV_FILE="$BOT_DIR/.env"
+get_env() {  # get_env KEY DEFAULT
+  local v=""
+  [ -f "$ENV_FILE" ] && v=$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$ENV_FILE" \
+        | tail -n1 | sed -E "s/^[[:space:]]*$1[[:space:]]*=//; s/^['\"]//; s/['\"][[:space:]]*$//")
+  echo "${v:-$2}"
+}
+
+# --------------------------------------------------------------------- версии
+# В сравнениях используем только стабильные релизы (vX.Y.Z без rc/beta-суффиксов).
+norm() { echo "${1#v}"; }  # убрать префикс v
+
+current_version() {
+  local v=""
+  if [ -f "$BOT_DIR/.release-please-manifest.json" ]; then
+    v=$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' "$BOT_DIR/.release-please-manifest.json" | head -n1 | tr -d '"')
+  fi
+  if [ -z "$v" ] && [ -f "$BOT_DIR/pyproject.toml" ]; then
+    v=$(grep -E '^version[[:space:]]*=' "$BOT_DIR/pyproject.toml" | head -n1 \
+        | sed -E 's/.*=[[:space:]]*["'\'']([0-9.]+)["'\''].*/\1/')
+  fi
+  if [ -z "$v" ]; then
+    v=$(git describe --tags --abbrev=0 2>/dev/null | sed -E 's/^v//; s/-.*//')
+  fi
+  echo "$v"
+}
+
+# Реальный git-ref для тега (учитываем префикс v или его отсутствие)
+tag_ref() {
+  local t; t="$(norm "$1")"
+  if git rev-parse -q --verify "refs/tags/v$t" >/dev/null; then echo "v$t"; return; fi
+  if git rev-parse -q --verify "refs/tags/$t"  >/dev/null; then echo "$t";  return; fi
+  echo ""
+}
+
+# ----------------------------------------------------------------- параметры БД
+detect_db() {
+  PG_USER="${PG_USER:-$(get_env POSTGRES_USER remnawave_user)}"
+  PG_DB="${PG_DB:-$(get_env POSTGRES_DB remnawave_bot)}"
+  PG_CONTAINER="${PG_CONTAINER:-remnawave_bot_db}"
+
+  # Если стандартный контейнер не запущен — попробуем найти по compose-проекту
+  if ! docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER"; then
+    local proj found
+    proj=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$BOT_CONTAINER" 2>/dev/null)
+    if [ -n "$proj" ]; then
+      found=$(docker ps --filter "label=com.docker.compose.project=$proj" \
+                        --filter "label=com.docker.compose.service=postgres" \
+                        --format '{{.Names}}' | head -n1)
+      [ -n "$found" ] && PG_CONTAINER="$found"
+    fi
+  fi
+}
+
+db_ok() {  # проверяем, что коннект и роль/БД валидны
+  docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc 'SELECT 1' >/dev/null 2>&1
+}
+
+ensure_db() {
+  detect_db
+  local tries=0
+  while ! db_ok; do
+    tries=$((tries+1))
+    warn "Не удалось подключиться к БД: контейнер='$PG_CONTAINER' user='$PG_USER' db='$PG_DB'."
+    if [ "$tries" -gt 3 ]; then
+      die "БД так и не доступна. Проверьте, что контейнер запущен, и параметры в .env."
+    fi
+    info "Контейнеры с PostgreSQL:"
+    docker ps --format '  {{.Names}}\t{{.Image}}' | grep -iE 'postgres|_db' || echo "  (не найдено)"
+    ask "  Имя контейнера БД [$PG_CONTAINER]: " _c; [ -n "${_c:-}" ] && PG_CONTAINER="$_c"
+    ask "  Пользователь PostgreSQL [$PG_USER]: " _u; [ -n "${_u:-}" ] && PG_USER="$_u"
+    ask "  База данных [$PG_DB]: "               _d; [ -n "${_d:-}" ] && PG_DB="$_d"
+  done
+  ok "БД доступна: контейнер='$PG_CONTAINER' user='$PG_USER' db='$PG_DB'"
+}
+
+# --------------------------------------------------------- проверка места на ФС
+check_disk() {  # check_disk [min_mb]
+  local min="${1:-$MIN_FREE_MB}" avail avail_mb
+  avail=$(df -Pk "$BOT_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+  if [ -z "$avail" ]; then warn "Не удалось определить свободное место — пропускаю проверку."; return 0; fi
+  avail_mb=$(( avail / 1024 ))
+  if [ "$avail_mb" -lt "$min" ]; then
+    err "Мало места на диске: доступно ${avail_mb} МБ, нужно минимум ${min} МБ."
+    err "Освободите место: 'docker system prune -af', удалите старые бэкапы/логи."
+    confirm "Продолжить несмотря на нехватку места?" || die "Остановлено из-за нехватки места на диске."
+  else
+    info "Свободно на диске: ${avail_mb} МБ (порог ${min} МБ) — ок."
+  fi
+}
+
+# ------------------------------------------------------------------- бэкап БД
+BACKUP_DIR="$BOT_DIR/backup"
+
+make_backup() {  # make_backup <метка>
+  [ "$SKIP_BACKUP" = "1" ] && { warn "SKIP_BACKUP=1 — бэкап пропущен."; return 0; }
+  mkdir -p "$BACKUP_DIR"
+  local label="${1:-manual}" file
+  file="$BACKUP_DIR/backup_$(date +%Y%m%d_%H%M%S)_${label}.dump"
+  info "Бэкап БД → ${file#$BOT_DIR/}"
+  if [ "$DRY_RUN" = "1" ]; then echo "  [dry-run] pg_dump пропущен"; return 0; fi
+  if docker exec "$PG_CONTAINER" pg_dump -Fc -U "$PG_USER" "$PG_DB" > "$file" 2>/tmp/pgdump.err; then
+    local sz; sz=$(du -h "$file" 2>/dev/null | cut -f1)
+    ok "Бэкап готов (${sz:-?})"
+  else
+    err "pg_dump завершился с ошибкой:"; cat /tmp/pgdump.err >&2
+    rm -f "$file"
+    die "Бэкап не создан — обновление остановлено ради безопасности данных."
+  fi
+  # ротация старых бэкапов
+  if [ "${BACKUP_RETENTION:-0}" -gt 0 ]; then
+    ls -1t "$BACKUP_DIR"/backup_*.dump 2>/dev/null | tail -n +$((BACKUP_RETENTION+1)) | xargs -r rm -f
+  fi
+}
+
+# -------------------------------------------------------- ожидание готовности
+wait_healthy() {
+  local timeout="${1:-240}" waited=0 state health
+  info "Ожидаю готовности контейнера $BOT_CONTAINER (миграции могут занять время)..."
+  while [ "$waited" -lt "$timeout" ]; do
+    state=$(docker inspect -f '{{.State.Status}}' "$BOT_CONTAINER" 2>/dev/null || echo "missing")
+    health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$BOT_CONTAINER" 2>/dev/null || echo none)
+    case "$state" in
+      running)
+        if [ "$health" = "healthy" ]; then ok "Контейнер healthy."; return 0; fi
+        if [ "$health" = "none" ] && [ "$waited" -ge 20 ]; then
+          ok "Контейнер запущен (healthcheck не настроен)."; return 0; fi
+        ;;
+      exited|dead)
+        err "Контейнер $BOT_CONTAINER упал (state=$state). Последние логи:"
+        DC logs --tail 40 "$BOT_CONTAINER" 2>/dev/null || true
+        return 1
+        ;;
+    esac
+    sleep 5; waited=$((waited+5))
+    printf '\r  ...%ss (state=%s health=%s)   ' "$waited" "$state" "$health"
+  done
+  echo
+  warn "Не дождался статуса healthy за ${timeout}s — продолжаю, но проверьте логи."
+  return 0
+}
+
+# ----------------------------------------------------------- один шаг апгрейда
+upgrade_to() {
+  local target="$1" ref
+  ref="$(tag_ref "$target")"
+  [ -n "$ref" ] || die "Не найден git-тег для версии $target"
+
+  step "👉 ВЕРСИЯ: $target    ⏰ $(date '+%F %T')"
+
+  if [ "$DRY_RUN" = "1" ]; then echo "  [dry-run] git checkout $ref + пересборка"; return 0; fi
+
+  check_disk    # перед каждой сборкой образа проверяем место
+  info "git checkout $ref"
+  git checkout -q "$ref" || die "Не удалось переключиться на $ref (есть незакоммиченные правки в отслеживаемых файлах?)"
+
+  info "Пересобираю и поднимаю контейнеры..."
+  if make -n reload >/dev/null 2>&1; then
+    make reload || die "make reload завершился ошибкой на $target"
+  else
+    DC up -d --build || die "docker compose up завершился ошибкой на $target"
+  fi
+
+  wait_healthy 300 || die "Контейнер не поднялся на версии $target. Обновление остановлено."
+  ok "Версия $target установлена."
+}
+
+# --------------------------------------------------------------- обновление cabinet
+update_cabinet() {
+  local cab="${CABINET_DIR:-$(dirname "$BOT_DIR")/cabinet}"
+  if [ ! -d "$cab" ]; then
+    info "Папка cabinet не найдена рядом с ботом — пропускаю."
+    return 0
+  fi
+  if [ ! -f "$cab/docker-compose.yml" ] && [ ! -f "$cab/docker-compose.yaml" ]; then
+    warn "В $cab нет docker-compose — пропускаю обновление кабинета."
+    return 0
+  fi
+  step "🖥  Обновляю Cabinet: $cab"
+  if [ "$DRY_RUN" = "1" ]; then echo "  [dry-run] pull + down + up -d"; return 0; fi
+  ( cd "$cab" && DC pull && DC down && DC up -d ) \
+    && ok "Cabinet обновлён." \
+    || warn "Не удалось обновить Cabinet — проверьте вручную в $cab"
+}
+
+# =============================================================== основной поток
+step "🚀 Bedolaga Bot — поэтапное обновление"
+
+info "Получаю свежие теги..."
+[ "$DRY_RUN" = "1" ] || git fetch --tags --quiet || warn "git fetch не удался — работаю с локальными тегами."
+
+CURRENT="$(current_version)"
+[ -n "$CURRENT" ] || { ask "Не удалось определить текущую версию. Введите её вручную (напр. 3.46.1): " CURRENT; }
+CURRENT="$(norm "$CURRENT")"
+info "Текущая версия: ${C_BOLD}$CURRENT${C_RESET}"
+
+# Полный отсортированный список стабильных версий
+mapfile -t ALL < <(git tag | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
+[ "${#ALL[@]}" -gt 0 ] || die "Не найдено ни одного тега версии в репозитории."
+
+LATEST="${TARGET_VERSION:-${ALL[-1]}}"
+LATEST="$(norm "$LATEST")"
+info "Целевая версия: ${C_BOLD}$LATEST${C_RESET}"
+
+# Список версий строго больше текущей и не больше целевой
+PENDING=()
+for v in "${ALL[@]}"; do
+  # v > CURRENT ?
+  [ "$(printf '%s\n%s\n' "$CURRENT" "$v" | sort -V | tail -n1)" = "$v" ] && [ "$v" != "$CURRENT" ] || continue
+  # v <= LATEST ?
+  [ "$(printf '%s\n%s\n' "$v" "$LATEST" | sort -V | tail -n1)" = "$LATEST" ] || continue
+  PENDING+=("$v")
+done
+
+# Проверяем параметры БД заранее (нужны для бэкапа)
+ensure_db
+# Проверяем свободное место до старта
+check_disk
+
+if [ "${#PENDING[@]}" -eq 0 ]; then
+  ok "Бот уже на версии $CURRENT — обновлять нечего."
+else
+  echo
+  info "Будут последовательно установлены версии:"
+  printf '   ➜ %s\n' "${PENDING[@]}"
+  echo
+  info "Бэкап БД делается в начале и далее каждые ${BACKUP_EVERY} версий → ${BACKUP_DIR#$BOT_DIR/}/"
+  confirm "Начать обновление ${CURRENT} → ${LATEST} (${#PENDING[@]} шаг(ов))?" \
+    || die "Отменено пользователем."
+
+  # Обязательный бэкап в самом начале
+  make_backup "pre_${CURRENT}"
+
+  i=0
+  for v in "${PENDING[@]}"; do
+    upgrade_to "$v"
+    i=$((i+1))
+    # Промежуточный бэкап каждые N версий (кроме самой последней — её страхует финальный)
+    if [ "${BACKUP_EVERY:-0}" -gt 0 ] && [ $(( i % BACKUP_EVERY )) -eq 0 ] && [ "$i" -lt "${#PENDING[@]}" ]; then
+      make_backup "after_${v}"
+    fi
+    [ "$DRY_RUN" = "1" ] || sleep 3
+  done
+  # Финальный бэкап на достигнутой версии
+  make_backup "post_${LATEST}"
+  ok "Бот обновлён до версии $LATEST"
+fi
+
+# Cabinet обновляем, когда бот доведён до последней версии
+if [ "$LATEST" = "${ALL[-1]}" ]; then
+  update_cabinet
+else
+  info "Целевая версия ($LATEST) не последняя — Cabinet не трогаю."
+fi
+
+# --------------------------------------------------- чистка неиспользуемых образов
+if [ "$PRUNE_IMAGES" = "1" ] && [ "$DRY_RUN" != "1" ]; then
+  step "🧹 Чистка неиспользуемых docker-образов"
+  before=$(docker system df --format '{{.Type}} {{.Reclaimable}}' 2>/dev/null | awk '/Images/{print $2$3}')
+  docker image prune -f >/dev/null 2>&1 && ok "Висячие (dangling) образы удалены." \
+    || warn "Не удалось выполнить docker image prune."
+  [ -n "${before:-}" ] && info "Освобождаемое место до чистки (образы): ${before}"
+  info "Для более глубокой очистки вручную: docker system prune -af (удалит ВСЕ неиспользуемые образы)."
+fi
+
+# ------------------------------------------------------------------ финал
+step "🎉 Готово"
+cat <<EOF
+
+Просмотр логов бота в реальном времени:
+
+  ${C_BOLD}cd "$BOT_DIR" && docker compose logs -f${C_RESET}
+
+Только логи контейнера бота:
+
+  cd "$BOT_DIR" && docker compose logs -f $BOT_CONTAINER
+
+Бэкапы БД лежат здесь:
+
+  $BACKUP_DIR/
+
+Восстановить БД из бэкапа при необходимости:
+
+  cat "$BACKUP_DIR/<файл>.dump" | docker exec -i $PG_CONTAINER \\
+      pg_restore -U $PG_USER -d $PG_DB --clean --if-exists
+
+EOF
