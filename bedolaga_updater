@@ -4,9 +4,9 @@
 # Репозиторий: https://github.com/BEDOLAGA-DEV/remnawave-bedolaga-telegram-bot
 #
 # Запуск прямо с GitHub (после того как зальёте скрипт в свой репозиторий/gist):
-#   bash <(curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/upgrade.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/upgrade.sh)
 # или:
-#   curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/upgrade.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/upgrade.sh | bash
 #
 # Что делает:
 #   1. Сам находит папку бота (по label запущенного контейнера remnawave_bot или по CWD).
