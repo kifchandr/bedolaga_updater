@@ -4,8 +4,6 @@
 # Репозиторий: https://github.com/BEDOLAGA-DEV/remnawave-bedolaga-telegram-bot
 #
 # Запуск прямо с GitHub (после того как зальёте скрипт в свой репозиторий/gist):
-#   bash <(curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/bedolaga_updater)
-# или:
 #   curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/bedolaga_updater | bash
 #
 # Что делает:
