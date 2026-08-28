@@ -10,7 +10,7 @@
 #   1. Сам находит папку бота (по label запущенного контейнера remnawave_bot или по CWD).
 #   2. Определяет текущую версию (из .release-please-manifest.json / pyproject / git-тега).
 #   3. Проверяет свободное место на диске перед стартом.
-#   4. Делает бэкап БД (pg_dump -Fc) в начале и далее каждые N версий (по умолчанию 5).
+#   4. Делает бэкап БД (pg_dump -Fc) перед каждой устанавливаемой версией.
 #   5. Поэтапно (тег за тегом) обновляется до последней версии, ждёт healthcheck.
 #   6. Если рядом с ботом есть папка cabinet и бот доведён до последней версии — обновляет её.
 #   7. Чистит неиспользуемые docker-образы и показывает, как смотреть логи.
@@ -21,7 +21,7 @@
 #   TARGET_VERSION=3.60.0     — обновляться не до последней, а до конкретной версии
 #   PG_USER / PG_DB / PG_CONTAINER — переопределить параметры БД
 #   BACKUP_RETENTION=10       — сколько последних бэкапов хранить (0 = не чистить)
-#   BACKUP_EVERY=5            — делать бэкап каждые N версий (кроме обязательного в начале)
+#   BACKUP_EVERY=1            — бэкап перед каждой N-й версией (1 = перед каждой, 0 = только один в начале)
 #   MIN_FREE_MB=3000         — минимум свободного места (МБ), иначе стоп
 #   PRUNE_IMAGES=1           — чистить неиспользуемые образы в конце (0 = не чистить)
 #   NO_CONFIRM=1              — не спрашивать подтверждение
@@ -64,7 +64,7 @@ confirm() {  # confirm "Продолжить?"
 DRY_RUN="${DRY_RUN:-0}"
 SKIP_BACKUP="${SKIP_BACKUP:-0}"
 BACKUP_RETENTION="${BACKUP_RETENTION:-10}"
-BACKUP_EVERY="${BACKUP_EVERY:-5}"      # делать бэкап каждые N устанавливаемых версий
+BACKUP_EVERY="${BACKUP_EVERY:-1}"      # бэкап перед каждой N-й версией (1 = перед каждой)
 MIN_FREE_MB="${MIN_FREE_MB:-3000}"     # минимум свободного места (МБ) для старта
 PRUNE_IMAGES="${PRUNE_IMAGES:-1}"      # чистить неиспользуемые образы в конце
 
@@ -222,9 +222,12 @@ make_backup() {  # make_backup <метка>
     rm -f "$file"
     die "Бэкап не создан — обновление остановлено ради безопасности данных."
   fi
-  # ротация старых бэкапов
+  # Ротация старых бэкапов. Дампы с меткой _keep не трогаем: это состояние
+  # "до обновления", самое ценное для отката. Бэкап делается перед каждой
+  # версией, поэтому на длинной цепочке обычная ротация съела бы именно его.
   if [ "${BACKUP_RETENTION:-0}" -gt 0 ]; then
-    ls -1t "$BACKUP_DIR"/backup_*.dump 2>/dev/null | tail -n +$((BACKUP_RETENTION+1)) | xargs -r rm -f
+    ls -1t "$BACKUP_DIR"/backup_*.dump 2>/dev/null | grep -v '_keep\.dump$' \
+      | tail -n +$((BACKUP_RETENTION+1)) | xargs -r rm -f
   fi
 }
 
@@ -251,8 +254,11 @@ wait_healthy() {
     printf '\r  ...%ss (state=%s health=%s)   ' "$waited" "$state" "$health"
   done
   echo
-  warn "Не дождался статуса healthy за ${timeout}s — продолжаю, но проверьте логи."
-  return 0
+  err "Не дождался статуса healthy за ${timeout}s."
+  err "Вероятнее всего ещё идут миграции, либо healthcheck бота не отвечает."
+  err "Продолжать нельзя: следующий шаг сделает 'docker compose down' и оборвёт их."
+  DC logs --tail 40 "$BOT_CONTAINER" 2>/dev/null || true
+  return 1
 }
 
 # ----------------------------------------------------------- один шаг апгрейда
@@ -276,7 +282,7 @@ upgrade_to() {
     DC up -d --build || die "docker compose up завершился ошибкой на $target"
   fi
 
-  wait_healthy 300 || die "Контейнер не поднялся на версии $target. Обновление остановлено."
+  wait_healthy 900 || die "Контейнер не поднялся на версии $target. Обновление остановлено."
   ok "Версия $target установлена."
 }
 
@@ -339,21 +345,30 @@ else
   info "Будут последовательно установлены версии:"
   printf '   ➜ %s\n' "${PENDING[@]}"
   echo
-  info "Бэкап БД делается в начале и далее каждые ${BACKUP_EVERY} версий → ${BACKUP_DIR#$BOT_DIR/}/"
+  if [ "${BACKUP_EVERY:-0}" -eq 1 ]; then
+    info "Бэкап БД делается перед КАЖДОЙ версией + финальный → ${BACKUP_DIR#$BOT_DIR/}/"
+  elif [ "${BACKUP_EVERY:-0}" -gt 1 ]; then
+    info "Бэкап БД делается перед каждой ${BACKUP_EVERY}-й версией + финальный → ${BACKUP_DIR#$BOT_DIR/}/"
+  else
+    info "Бэкап БД делается один раз в начале и один в конце → ${BACKUP_DIR#$BOT_DIR/}/"
+  fi
+  info "Хранится последних дампов: ${BACKUP_RETENTION} (дамп до обновления помечен _keep и не ротируется)"
   confirm "Начать обновление ${CURRENT} → ${LATEST} (${#PENDING[@]} шаг(ов))?" \
     || die "Отменено пользователем."
 
-  # Обязательный бэкап в самом начале
-  make_backup "pre_${CURRENT}"
+  # Если поштучные бэкапы отключены (BACKUP_EVERY=0), обязательный дамп в начале
+  # всё равно делаем: без него откатываться будет не на что.
+  [ "${BACKUP_EVERY:-0}" -gt 0 ] || make_backup "pre_${CURRENT}_keep"
 
   i=0
   for v in "${PENDING[@]}"; do
+    # Бэкап ДО установки версии: миграции необратимы, и откатываться нужно на
+    # состояние перед конкретным шагом, а не на то, что было N версий назад.
+    if [ "${BACKUP_EVERY:-0}" -gt 0 ] && [ $(( i % BACKUP_EVERY )) -eq 0 ]; then
+      if [ "$i" -eq 0 ]; then make_backup "pre_${v}_keep"; else make_backup "pre_${v}"; fi
+    fi
     upgrade_to "$v"
     i=$((i+1))
-    # Промежуточный бэкап каждые N версий (кроме самой последней — её страхует финальный)
-    if [ "${BACKUP_EVERY:-0}" -gt 0 ] && [ $(( i % BACKUP_EVERY )) -eq 0 ] && [ "$i" -lt "${#PENDING[@]}" ]; then
-      make_backup "after_${v}"
-    fi
     [ "$DRY_RUN" = "1" ] || sleep 3
   done
   # Финальный бэкап на достигнутой версии
