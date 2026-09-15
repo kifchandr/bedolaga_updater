@@ -438,6 +438,15 @@ patches_fetch() {
   while IFS= read -r rel || [ -n "$rel" ]; do
     rel="${rel%$'\r'}"
     case "$rel" in ''|'#'*) continue;; esac
+    # Манифест приходит по сети и раскладывает файлы по чужой машине.
+    # Путь наружу каталога — либо ошибка, либо подмена; в обоих случаях стоп.
+    case "$rel" in
+      /*|*..*)
+        rm -rf "$stage"
+        err "Подозрительный путь в манифесте: '$rel'. Установка прервана."
+        return 1
+        ;;
+    esac
     mkdir -p "$stage/$(dirname "$rel")"
     info "  ↓ $rel"
     if ! curl -fsSL "$PATCHES_BASE_URL/$rel" -o "$stage/$rel"; then
@@ -450,8 +459,20 @@ patches_fetch() {
   # Первая установка: заводим patches.env из примера.
   [ -f "$stage/patches.env" ] || cp "$stage/patches.env.example" "$stage/patches.env"
 
-  rm -rf "$pdir"
-  mv "$stage" "$pdir" || { err "Не удалось переместить $stage → $pdir"; return 1; }
+  # Старую папку сначала отодвигаем и только потом удаляем: если mv провалится,
+  # рабочие патчи останутся на месте, а не исчезнут вместе с каталогом.
+  local old=""
+  if [ -d "$pdir" ]; then
+    old="$pdir.old.$$"
+    mv "$pdir" "$old" || { rm -rf "$stage"; err "Не удалось отодвинуть $pdir"; return 1; }
+  fi
+  if ! mv "$stage" "$pdir"; then
+    err "Не удалось переместить $stage → $pdir"
+    [ -n "$old" ] && mv "$old" "$pdir" && warn "Вернул прежнюю версию патчей."
+    rm -rf "$stage"
+    return 1
+  fi
+  [ -n "$old" ] && rm -rf "$old"
   # Внутри контейнера бот работает под uid 1000 и монтирует папку read-only.
   chmod -R a+rX "$pdir"
   patches_sync_switches
@@ -506,10 +527,12 @@ patches_print_switches() {
   for key in $(patches_switches); do
     n=$((n+1))
     state=$(patches_switch_state "$key")
+    # Ширину не задаём через %-Ns: в printf она считается в байтах, а кириллица
+    # занимает по два — колонки разъезжались бы. Выравниваем текстом.
     if [ "$state" = "1" ]; then
-      printf '  %d) %s%-8s%s %s\n' "$n" "$C_GRN" "[вкл]" "$C_RESET" "$(patches_switch_label "$key")"
+      printf '  %d) %s[вкл] %s %s\n'  "$n" "$C_GRN" "$C_RESET" "$(patches_switch_label "$key")"
     else
-      printf '  %d) %s%-8s%s %s\n' "$n" "$C_YEL" "[выкл]" "$C_RESET" "$(patches_switch_label "$key")"
+      printf '  %d) %s[выкл]%s %s\n' "$n" "$C_YEL" "$C_RESET" "$(patches_switch_label "$key")"
     fi
     printf '     %s\n' "$key"
   done
@@ -559,11 +582,11 @@ patches_toggle_menu() {
     return 0
   fi
   if confirm "Перезапустить бота, чтобы изменения вступили в силу?"; then
-    ( cd "$BOT_DIR" && DC up -d ) || { err "docker compose up завершился ошибкой."; return 1; }
-    wait_healthy 600 || { err "Контейнер не поднялся."; return 1; }
+    patches_restart || return 1
     patches_verify
   else
-    info "Изменения применятся при следующем перезапуске: cd \"$BOT_DIR\" && docker compose up -d"
+    warn "Пока бот не перезапущен, список патчей не изменился."
+    info "Применить: cd \"$BOT_DIR\" && docker compose up -d --force-recreate $(bot_service)"
   fi
 }
 
@@ -598,19 +621,64 @@ YAML
   ok "docker-compose.override.yml записан."
 }
 
-# Патчи печатают строку о подключении в самом начале лога контейнера.
+# Имя compose-сервиса бота. Обычно 'bot', но берём из label запущенного
+# контейнера, чтобы переименование сервиса ничего не ломало.
+bot_service() {
+  local s
+  s=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$BOT_CONTAINER" 2>/dev/null)
+  echo "${s:-bot}"
+}
+
+# Перезапуск с гарантией, что новый процесс подхватит свежие патчи.
+#
+# Одного `docker compose up -d` мало: patches/ и patches.env подключены
+# bind-mount'ом, конфигурация compose при этом не меняется, и compose честно
+# отвечает «up-to-date», оставляя работать старый процесс со старым кодом.
+# Поэтому сервис бота пересоздаём принудительно. Зависимости (postgres, redis)
+# поднимает первый up -d, а --no-deps во втором не даёт их пересоздать.
+patches_restart() {
+  local svc; svc="$(bot_service)"
+  ( cd "$BOT_DIR" && DC up -d ) || { err "docker compose up завершился ошибкой."; return 1; }
+  if ! ( cd "$BOT_DIR" && DC up -d --force-recreate --no-deps "$svc" ); then
+    warn "Не удалось пересоздать сервис '$svc' — перезапускаю контейнер напрямую."
+    docker restart "$BOT_CONTAINER" >/dev/null 2>&1 \
+      || { err "Не удалось перезапустить $BOT_CONTAINER."; return 1; }
+  fi
+  wait_healthy 600 || { err "Контейнер не поднялся после перезапуска."; return 1; }
+}
+
+# Реестр патчей печатает при старте итоговую строку («подключены патчи…» либо
+# «ни один патч не подключён»), а следом уточнения. Судим строго по последнему
+# запуску: обычно контейнер пересоздан и лог чистый, но в запасном сценарии с
+# `docker restart` в нём остаются прошлые запуски, и старая удачная строка
+# выдала бы успех там, где свежий запуск упал.
 patches_verify() {
-  local logs line
-  logs=$(docker logs "$BOT_CONTAINER" 2>&1 | head -n 300 || true)
-  line=$(echo "$logs" | grep -F '[bedolaga-patches]' | head -n 5 || true)
-  if [ -z "$line" ]; then
+  local logs block
+  logs=$(docker logs --tail 2000 "$BOT_CONTAINER" 2>&1 || true)
+  # Идём по строкам патчей с конца и останавливаемся на первой же итоговой —
+  # получаем блок последнего запуска.
+  block=$(echo "$logs" | grep -F '[bedolaga-patches]' \
+          | tac | awk '{ print } /подключены патчи|ни один патч не подключён/ { exit }' | tac)
+
+  if [ -z "$block" ]; then
     warn "В логах контейнера не видно ни одной строки [bedolaga-patches]."
     warn "Проверьте вручную: docker logs $BOT_CONTAINER | grep bedolaga-patches"
     return 1
   fi
-  echo "$line" | sed 's/^/   /'
-  if echo "$line" | grep -q 'подключены патчи'; then
+  echo "$block" | sed 's/^/   /'
+
+  if echo "$block" | grep -q 'упали при подключении'; then
+    warn "Часть патчей упала при подключении — бот работает, но эти правки не применились."
+    warn "Подробности с трейсбеком: docker logs $BOT_CONTAINER | grep -A20 bedolaga-patches"
+    return 1
+  fi
+  if echo "$block" | grep -q 'подключены патчи'; then
     ok "Патчи подключены."
+    return 0
+  fi
+  # Все патчи выключены — это осознанный выбор администратора, а не сбой.
+  if echo "$block" | grep -q 'выключены настройкой'; then
+    ok "Патчи на месте, но все выключены настройкой."
     return 0
   fi
   warn "Патчи загрузились с ошибкой — бот работает, но правки не применились."
@@ -627,8 +695,7 @@ patches_apply() {
   patches_write_override || return 1
 
   info "Перезапускаю бота с патчами..."
-  ( cd "$BOT_DIR" && DC up -d ) || { err "docker compose up завершился ошибкой."; return 1; }
-  wait_healthy 600 || { err "Контейнер не поднялся после подключения патчей."; return 1; }
+  patches_restart || return 1
   patches_verify
 }
 
@@ -657,9 +724,11 @@ patches_remove() {
 
   if [ "$DRY_RUN" != "1" ]; then
     info "Перезапускаю бота в штатной конфигурации..."
-    ( cd "$BOT_DIR" && DC up -d ) && wait_healthy 600 \
-      && ok "Бот работает без патчей." \
-      || warn "Проверьте состояние контейнера вручную."
+    if patches_restart; then
+      ok "Бот работает без патчей."
+    else
+      warn "Проверьте состояние контейнера вручную."
+    fi
   fi
 }
 

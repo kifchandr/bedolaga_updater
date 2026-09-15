@@ -192,15 +192,17 @@ def _ensure_task() -> None:
 async def _loop() -> None:
     await asyncio.sleep(_startup_delay_seconds())
 
-    try:
-        await _ensure_tables()
-        await _ensure_floor()
-    except Exception as error:
-        _log_error('Не удалось подготовить таблицы патча connect_reminder', error=str(error))
-        return
-
+    ready = False
     while True:
         try:
+            # Подготовку таблиц повторяем до успеха, а не делаем один раз до
+            # цикла: апдейтер накатывает версии пачкой, и alembic-миграции на
+            # старте могут идти дольше стартовой паузы. Единственная попытка
+            # означала бы, что патч молча умер до перезапуска бота.
+            if not ready:
+                await _ensure_tables()
+                await _ensure_floor()
+                ready = True
             await _tick()
         except asyncio.CancelledError:
             raise
@@ -367,29 +369,42 @@ async def _tick() -> None:
     from app.database.database import AsyncSessionLocal
 
     bot = _get_bot()
+    scope = _scope()
     sent = 0
+    # Кандидатов выбрали одним запросом, поэтому у человека с несколькими
+    # новыми подписками (бот поддерживает мультитариф) в списке будет несколько
+    # строк. В режиме scope=user это один и тот же ключ — без этого набора он
+    # получил бы столько сообщений, сколько подписок, ещё до первой записи в БД.
+    handled: set[int] = set()
 
     async with AsyncSessionLocal() as db:
         for row in candidates:
-            state = states.get(row['remnawave_id'])
-            if state is None:
-                # Панель не ответила именно по этому пользователю — перепроверим позже.
-                continue
-            if state == 'connected':
-                await _mark(db, row['user_id'], row['subscription_id'], STATE_CONNECTED, None)
-                continue
-            if state == 'absent':
-                await _mark(db, row['user_id'], row['subscription_id'], STATE_NO_PANEL_USER, None)
+            key_id = row['subscription_id'] if scope == 'subscription' else row['user_id']
+            if key_id in handled:
                 continue
 
-            state, channel = await _deliver(bot, row)
-            if state is None:
+            panel_state = states.get(row['remnawave_id'])
+            if panel_state is None:
+                # Панель не ответила именно по этому пользователю — перепроверим позже.
+                continue
+            if panel_state == 'connected':
+                await _mark(db, row['user_id'], row['subscription_id'], STATE_CONNECTED, None)
+                handled.add(key_id)
+                continue
+            if panel_state == 'absent':
+                await _mark(db, row['user_id'], row['subscription_id'], STATE_NO_PANEL_USER, None)
+                handled.add(key_id)
+                continue
+
+            result_state, channel = await _deliver(bot, row)
+            if result_state is None:
                 # Временный сбой: строку не пишем, повторим на следующем тике,
                 # пока подписка не выпадет из окна MAX_AGE.
                 continue
 
-            await _mark(db, row['user_id'], row['subscription_id'], state, channel)
-            if state == STATE_SENT:
+            await _mark(db, row['user_id'], row['subscription_id'], result_state, channel)
+            handled.add(key_id)
+            if result_state == STATE_SENT:
                 sent += 1
                 await asyncio.sleep(0.1)  # мягкий троттлинг Telegram
 

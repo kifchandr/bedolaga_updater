@@ -400,8 +400,22 @@ def _format_report_text(ranking, start_utc, end_utc, min_rub, scope, top, sort, 
             f'{i}. {html.escape(r["name"])} — '
             f'{r["invited"]} пригл. / {r["purchased"]} опл. / {settings.format_price(r["revenue_kopeks"])}'
         )
+    tail = '\n…(полный список в CSV)'
     out = '\n'.join(lines)
-    return out[:3990] + '\n…(полный список в CSV)' if len(out) > 4000 else out
+    if len(out) <= 4096:
+        return out
+    # Режем по границе строк, а не по символам: обрыв посреди HTML-сущности
+    # («&amp;» из экранированного имени) Telegram считает ошибкой разметки и
+    # отказывается публиковать сообщение целиком.
+    limit = 4096 - len(tail)
+    kept = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > limit:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    return '\n'.join(kept) + tail
 
 
 async def _generate_and_send(
