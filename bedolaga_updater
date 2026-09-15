@@ -454,7 +454,117 @@ patches_fetch() {
   mv "$stage" "$pdir" || { err "Не удалось переместить $stage → $pdir"; return 1; }
   # Внутри контейнера бот работает под uid 1000 и монтирует папку read-only.
   chmod -R a+rX "$pdir"
+  patches_sync_switches
   ok "Файлы патчей обновлены: ${pdir#$BOT_DIR/}/"
+}
+
+# Список выключателей берём из patches.env: там он полный, потому что
+# patches_sync_switches дописывает недостающие при каждом обновлении.
+patches_switches() {
+  local env; env="$(patches_dir)/patches.env"
+  [ -f "$env" ] && grep -oE '^PATCH_[A-Z0-9_]+_ENABLED' "$env" | awk '!seen[$0]++'
+}
+
+patches_switch_state() {  # patches_switch_state KEY -> 1|0
+  local env v; env="$(patches_dir)/patches.env"
+  v=$(grep -E "^$1=" "$env" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d '[:space:]')
+  case "$v" in 0|false|no|off|'') [ -z "$v" ] && echo 1 || echo 0 ;; *) echo 1 ;; esac
+}
+
+# Комментарий-описание — это строка над выключателем в patches.env.
+patches_switch_label() {  # patches_switch_label KEY
+  local env; env="$(patches_dir)/patches.env"
+  awk -v key="$1" '
+    /^#/ { last = substr($0, 2); sub(/^[ \t]+/, "", last); next }
+    $0 ~ "^" key "=" { print last; found = 1; exit }
+    { last = "" }
+    END { if (!found) print "" }
+  ' "$env" 2>/dev/null
+}
+
+# Новый патч в апстриме приносит новый выключатель. patches.env мы не
+# перезаписываем (там настройки администратора), поэтому недостающие
+# выключатели дописываем — иначе новый патч работал бы, но в меню его не было.
+patches_sync_switches() {
+  local pdir env example key added=0
+  pdir="$(patches_dir)"; env="$pdir/patches.env"; example="$pdir/patches.env.example"
+  [ -f "$env" ] && [ -f "$example" ] || return 0
+
+  for key in $(grep -oE '^PATCH_[A-Z0-9_]+_ENABLED' "$example" | awk '!seen[$0]++'); do
+    grep -qE "^[[:space:]]*$key=" "$env" && continue
+    if [ "$added" -eq 0 ]; then
+      printf '\n# --- Выключатели новых патчей, добавлены %s ---\n' "$(date +%F)" >> "$env"
+      added=1
+    fi
+    printf '%s\n%s=1\n' "# $(awk -v k="$key" '/^#/ {l=substr($0,2); sub(/^[ \t]+/,"",l); next} $0 ~ "^" k "=" {print l; exit} {l=""}' "$example")" "$key" >> "$env"
+    info "  + новый патч включён: $key"
+  done
+}
+
+patches_print_switches() {
+  local key state n=0
+  for key in $(patches_switches); do
+    n=$((n+1))
+    state=$(patches_switch_state "$key")
+    if [ "$state" = "1" ]; then
+      printf '  %d) %s%-8s%s %s\n' "$n" "$C_GRN" "[вкл]" "$C_RESET" "$(patches_switch_label "$key")"
+    else
+      printf '  %d) %s%-8s%s %s\n' "$n" "$C_YEL" "[выкл]" "$C_RESET" "$(patches_switch_label "$key")"
+    fi
+    printf '     %s\n' "$key"
+  done
+  [ "$n" -eq 0 ] && warn "В patches.env не найдено ни одного выключателя PATCH_*_ENABLED."
+  return 0
+}
+
+patches_toggle_menu() {
+  step "🧩 Патчи: включение / выключение"
+  local env; env="$(patches_dir)/patches.env"
+  if [ ! -f "$env" ]; then
+    err "Нет $env — сначала установите патчи (пункт 1)."
+    return 1
+  fi
+
+  local changed=0
+  while :; do
+    echo
+    echo "Патчи (по умолчанию включено всё):"
+    patches_print_switches
+    echo
+    local choice="" keys key state new
+    ask "Номер для переключения (Enter — назад): " choice
+    [ -z "$choice" ] && break
+    case "$choice" in
+      *[!0-9]*|0) warn "Нужен номер из списка."; continue ;;
+    esac
+    keys=$(patches_switches)
+    key=$(echo "$keys" | sed -n "${choice}p")
+    if [ -z "$key" ]; then warn "Нет пункта с номером $choice."; continue; fi
+
+    state=$(patches_switch_state "$key")
+    [ "$state" = "1" ] && new=0 || new=1
+    if grep -qE "^$key=" "$env"; then
+      sed -i -E "s|^$key=.*|$key=$new|" "$env"
+    else
+      printf '%s=%s\n' "$key" "$new" >> "$env"
+    fi
+    changed=1
+    [ "$new" = "1" ] && ok "$key включён" || ok "$key выключен"
+  done
+
+  [ "$changed" = "0" ] && { info "Ничего не изменено."; return 0; }
+
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "  [dry-run] перезапуск пропущен"
+    return 0
+  fi
+  if confirm "Перезапустить бота, чтобы изменения вступили в силу?"; then
+    ( cd "$BOT_DIR" && DC up -d ) || { err "docker compose up завершился ошибкой."; return 1; }
+    wait_healthy 600 || { err "Контейнер не поднялся."; return 1; }
+    patches_verify
+  else
+    info "Изменения применятся при следующем перезапуске: cd \"$BOT_DIR\" && docker compose up -d"
+  fi
 }
 
 patches_write_override() {
@@ -569,8 +679,10 @@ patches_status() {
     ( cd "$pdir" && find . -name '*.py' -o -name 'patches.env' | sed 's|^\./|     |' | sort )
   fi
   if [ -f "$pdir/patches.env" ]; then
+    echo "  патчи    :"
+    patches_print_switches | sed 's/^/  /'
     echo "  настройки:"
-    grep -E '^[A-Z0-9_]+=' "$pdir/patches.env" | sed 's/^/     /'
+    grep -E '^[A-Z0-9_]+=' "$pdir/patches.env" | grep -v '_ENABLED=' | sed 's/^/     /'
   fi
   if docker ps --format '{{.Names}}' | grep -qx "$BOT_CONTAINER"; then
     echo "  в логах  :"
@@ -591,18 +703,20 @@ patches_menu() {
     cat <<'MENU'
 
   1) Установить / обновить патчи
-  2) Показать статус
-  3) Удалить патчи
-  4) Выход
+  2) Включить / выключить патчи
+  3) Показать статус
+  4) Удалить патчи
+  5) Выход
 
 MENU
     local choice=""
-    ask "Выберите пункт [1-4]: " choice
+    ask "Выберите пункт [1-5]: " choice
     case "$choice" in
-      1) patches_apply  || warn "Установка патчей завершилась с ошибкой." ;;
-      2) patches_status ;;
-      3) patches_remove ;;
-      4|q|Q|'') return 0 ;;
+      1) patches_apply       || warn "Установка патчей завершилась с ошибкой." ;;
+      2) patches_toggle_menu || warn "Не удалось изменить список патчей." ;;
+      3) patches_status ;;
+      4) patches_remove ;;
+      5|q|Q|'') return 0 ;;
       *) warn "Не понял ответ: $choice" ;;
     esac
   done

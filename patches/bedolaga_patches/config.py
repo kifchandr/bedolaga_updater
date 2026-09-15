@@ -84,6 +84,22 @@ def get_int(key: str, default: int, *, minimum: int | None = None, maximum: int 
     return value
 
 
+def get_float(key: str, default: float) -> float:
+    raw = get(key)
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def get_list(key: str, default: list[str]) -> list[str]:
+    """Список через запятую. Пустое значение = пустой список, а не default."""
+    raw = get(key)
+    if raw is None:
+        return list(default)
+    return [item.strip() for item in raw.split(',') if item.strip()]
+
+
 def get_str(key: str, default: str) -> str:
     raw = get(key)
     if raw is None:
