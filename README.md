@@ -4,12 +4,29 @@
 и механизм патчей — собственных правок поведения бота, которые переживают обновление.
 
 ```bash
-# обновить бота (и переустановить патчи, если они стоят)
 curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/bedolaga_updater | bash
+```
 
-# меню патчей: установить / статус / удалить
+Открывается меню:
+
+```
+  1) Обновить бота
+  2) Управление патчами
+  3) Выход
+```
+
+Можно сразу в нужный раздел, минуя меню:
+
+```bash
+# сразу обновление
+curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/bedolaga_updater | bash -s -- update
+
+# сразу патчи
 curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/bedolaga_updater | bash -s -- patches
 ```
+
+В неинтерактивном запуске (cron, `NO_CONFIRM=1`) меню пропускается и сразу идёт
+обновление — автоматизация работает как раньше.
 
 ---
 
@@ -62,11 +79,19 @@ services:
 
 ## Работа с патчами
 
+Пункт «2) Управление патчами» в главном меню, либо сразу:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/bedolaga_updater | bash -s -- patches
 ```
 
-Меню: установить/обновить, включить/выключить, показать статус, удалить.
+```
+  1) Установить / обновить патчи
+  2) Включить / выключить патчи
+  3) Показать статус
+  4) Удалить патчи
+  5) Назад
+```
 
 Проверить, что патчи подключились:
 
