@@ -597,27 +597,21 @@ patches_toggle_menu() {
   fi
 }
 
-patches_write_override() {
+# Всё ли нужное уже есть в override. Если да — файл не трогаем: в него могли
+# дописать своё (частый случай — build.network: host, без которого на хостах с
+# нестандартным MTU не идёт сборка), и перегенерация это стёрла бы.
+patches_override_ok() {
   local ovr; ovr="$(override_file)"
+  [ -f "$ovr" ] || return 1
+  grep -qF "$PATCH_MARKER" "$ovr" || return 1
+  grep -qF './patches:/app/patches:ro' "$ovr" || return 1
+  grep -qF '/app/patches/bootstrap.py' "$ovr" || return 1
+}
 
-  if [ -f "$ovr" ] && ! grep -qF "$PATCH_MARKER" "$ovr"; then
-    warn "В папке бота уже есть docker-compose.override.yml, созданный не этим скриптом."
-    warn "Скрипт не умеет сливать его со своим — придётся выбрать."
-    confirm "Перезаписать его (копия останется рядом с суффиксом .bak-<дата>)?" n \
-      || { err "Оставил чужой override нетронутым. Патчи не подключены."; return 1; }
-    cp -p "$ovr" "$ovr.bak-$(date +%Y%m%d_%H%M%S)"
-  fi
-
-  cat > "$ovr" <<YAML
-$PATCH_MARKER
-# Файл создан скриптом bedolaga_updater и им же управляется.
-# Он подключает патчи из ./patches, не меняя ни одного файла бота.
-# Убрать патчи:  bedolaga_updater patches  →  «Удалить патчи»
-#
-# BEDOLAGA_PATCHES=0 отключает патчи, не удаляя их (полезно для диагностики:
-# так можно проверить, виноват ли патч в проблеме).
-services:
-  bot:
+# Блок, который патчам нужен внутри services.bot. Один источник и для
+# генерируемого файла, и для подсказки по ручному слиянию — чтобы не разъехались.
+patches_override_block() {
+  cat <<'YAML'
     volumes:
       - ./patches:/app/patches:ro
     environment:
@@ -625,6 +619,62 @@ services:
       BEDOLAGA_APP_DIR: /app
     command: ['python', '/app/patches/bootstrap.py']
 YAML
+}
+
+patches_write_override() {
+  local ovr; ovr="$(override_file)"
+
+  if patches_override_ok; then
+    ok "docker-compose.override.yml уже настроен — оставляю как есть."
+    return 0
+  fi
+
+  if [ -f "$ovr" ] && ! grep -qF "$PATCH_MARKER" "$ovr"; then
+    warn "В папке бота уже есть docker-compose.override.yml, созданный не этим скриптом."
+    echo "Его содержимое:" >&2
+    sed 's/^/   │ /' "$ovr" >&2
+    echo >&2
+    warn "Перезапись сотрёт всё, что в нём настроено, — а настроено там обычно то,"
+    warn "без чего бот или сборка не работают на этом сервере."
+    warn "Надёжнее слить руками: допишите в services.bot эти ключи,"
+    warn "а первой строкой файла поставьте маркер — тогда скрипт файл не тронет:"
+    {
+      echo
+      echo "   $PATCH_MARKER"
+      echo "   services:"
+      echo "     bot:"
+      patches_override_block | sed 's/^/   /'
+      echo
+    } >&2
+    confirm "Всё-таки перезаписать? (копия останется рядом с суффиксом .bak-<дата>)" n \
+      || { err "Оставил ваш override нетронутым. Патчи не подключены."; return 1; }
+  fi
+
+  # Копию делаем перед любой перезаписью, в том числе своего же файла: в нём
+  # могло оказаться дописанное вручную, а сюда мы попадаем как раз тогда,
+  # когда содержимое не распозналось как целое.
+  if [ -f "$ovr" ]; then
+    local backup="$ovr.bak-$(date +%Y%m%d_%H%M%S)"
+    cp -p "$ovr" "$backup" && info "Прежний файл сохранён: ${backup##*/}"
+  fi
+
+  {
+    echo "$PATCH_MARKER"
+    cat <<'YAML'
+# Файл создан скриптом bedolaga_updater. Он подключает патчи из ./patches,
+# не меняя ни одного файла бота.
+#
+# Дописывать сюда своё МОЖНО: пока в файле есть маркер выше и оба ключа патчей
+# (монтирование ./patches и command на bootstrap.py), скрипт его не перезапишет.
+# Убрать патчи:  bedolaga_updater patches  →  «Удалить патчи»
+#
+# BEDOLAGA_PATCHES=0 отключает патчи, не удаляя их (полезно для диагностики:
+# так можно проверить, виноват ли патч в проблеме).
+services:
+  bot:
+YAML
+    patches_override_block
+  } > "$ovr"
   ok "docker-compose.override.yml записан."
 }
 
