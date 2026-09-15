@@ -50,6 +50,8 @@
 #   PATCHES=auto|1|0         — переустанавливать ли патчи после обновления
 #                              (auto = только если уже установлены)
 #   PATCHES_BASE_URL=...     — откуда качать файлы патчей
+#   PLAIN_MENU=1             — меню без стрелок, ввод номера пункта
+#                              (включается само, если терминала нет)
 
 set -uo pipefail
 
@@ -57,9 +59,16 @@ set -uo pipefail
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'
   C_YEL=$'\033[33m'; C_BLU=$'\033[36m'; C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'; C_SEL=$'\033[1;97;44m'   # выбранный пункт меню: белым по синему
+  C_HIDE=$'\033[?25l'; C_SHOW=$'\033[?25h'   # курсор во время рисования меню
 else
   C_RESET=; C_RED=; C_GRN=; C_YEL=; C_BLU=; C_BOLD=
+  C_DIM=; C_SEL=; C_HIDE=; C_SHOW=
 fi
+
+# Прерывание в момент, когда курсор спрятан, оставило бы его невидимым до конца
+# сессии — возвращаем его на любом выходе.
+trap 'printf "%s" "$C_SHOW"' EXIT
 
 info()  { echo "${C_BLU}ℹ️  $*${C_RESET}"; }
 ok()    { echo "${C_GRN}✅ $*${C_RESET}"; }
@@ -87,6 +96,69 @@ confirm() {  # confirm "Продолжить?" [default: y]
   # Классы вида [yYдД] в C-локали сравниваются побайтно, и любой ответ,
   # начинающийся с кириллицы, попадал в "да". Сверяем префиксы целиком.
   case "$a" in y*|Y*|д*|Д*) return 0;; *) return 1;; esac
+}
+
+# Меню с выбором стрелками.  pick RESULT_VAR "пункт" "пункт" ...
+#   ↑/↓ (или k/j) — перебор, Enter — выбрать, цифра — сразу нужный пункт,
+#   q/Esc — отмена. В RESULT_VAR кладётся номер пункта начиная с 1,
+#   при отмене — пустая строка.
+#
+# Перерисовка идёт от запомненной позиции курсора с очисткой всего ниже, а не
+# «подняться на N строк»: длинный пункт переносится на вторую строку, и счёт
+# строк разъехался бы.  Место под меню резервируется заранее, чтобы прокрутка
+# терминала случилась до того, как позиция запомнена.
+pick() {
+  local __var="$1"; shift
+  local items=("$@") n=$# cur=0 key rest i
+
+  printf -v "$__var" '%s' ''
+  [ "$n" -gt 0 ] || return 0
+
+  # Нет терминала (cron, пайп без tty) — спрашиваем номер, как раньше.
+  if [ ! -r /dev/tty ] || [ ! -t 1 ] || [ "${PLAIN_MENU:-0}" = "1" ]; then
+    local ans="" idx=1
+    for i in "${items[@]}"; do echo "  $idx) $i"; idx=$((idx+1)); done
+    echo
+    ask "Выберите пункт [1-$n]: " ans
+    printf -v "$__var" '%s' "$ans"
+    return 0
+  fi
+
+  for ((i = 0; i < n; i++)); do echo; done
+  printf '\033[%dA\033[s%s' "$n" "$C_HIDE"
+
+  while :; do
+    printf '\033[u\033[J'
+    for ((i = 0; i < n; i++)); do
+      if [ "$i" = "$cur" ]; then
+        printf '  %s ❯ %s %s\n' "$C_SEL" "${items[$i]}" "$C_RESET"
+      else
+        printf '    %s%s%s\n' "$C_DIM" "${items[$i]}" "$C_RESET"
+      fi
+    done
+
+    IFS= read -rsn1 key < /dev/tty || { printf '%s' "$C_SHOW"; return 0; }
+    case "$key" in
+      $'\e')
+        rest=""
+        IFS= read -rsn2 -t 0.1 rest < /dev/tty
+        case "$rest" in
+          '[A'|'OA') cur=$(( (cur - 1 + n) % n )) ;;
+          '[B'|'OB') cur=$(( (cur + 1) % n )) ;;
+          '')        printf '%s' "$C_SHOW"; return 0 ;;   # одиночный Esc — отмена
+        esac
+        ;;
+      '')  printf '%s' "$C_SHOW"; printf -v "$__var" '%s' "$((cur + 1))"; return 0 ;;
+      [1-9])
+        if [ "$key" -le "$n" ]; then
+          printf '%s' "$C_SHOW"; printf -v "$__var" '%s' "$key"; return 0
+        fi
+        ;;
+      k|K) cur=$(( (cur - 1 + n) % n )) ;;
+      j|J) cur=$(( (cur + 1) % n )) ;;
+      q|Q) printf '%s' "$C_SHOW"; return 0 ;;
+    esac
+  done
 }
 
 # ------------------------------------------------------------------- аргументы
@@ -557,20 +629,35 @@ patches_toggle_menu() {
 
   local changed=0
   while :; do
-    echo
-    echo "Патчи (по умолчанию включено всё):"
-    patches_print_switches
-    echo
-    local choice="" keys key state new
-    ask "Номер для переключения (Enter — назад): " choice
-    [ -z "$choice" ] && break
-    case "$choice" in
-      *[!0-9]*|0) warn "Нужен номер из списка."; continue ;;
-    esac
-    keys=$(patches_switches)
-    key=$(echo "$keys" | sed -n "${choice}p")
-    if [ -z "$key" ]; then warn "Нет пункта с номером $choice."; continue; fi
+    local keys=() items=() key state new choice=""
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      keys+=("$key")
+      # Пометку рисуем текстом, а не цветом: подсветка выбранного пункта —
+      # это фон на всю строку, и вложенный сброс цвета рвал бы её посередине.
+      if [ "$(patches_switch_state "$key")" = "1" ]; then
+        items+=("[✓] $(patches_switch_label "$key")")
+      else
+        items+=("[ ] $(patches_switch_label "$key")")
+      fi
+    done < <(patches_switches)
 
+    if [ "${#keys[@]}" -eq 0 ]; then
+      warn "В patches.env не найдено ни одного выключателя PATCH_*_ENABLED."
+      return 1
+    fi
+    items+=("Назад")
+
+    echo
+    echo "Enter переключает выбранный патч. По умолчанию включено всё."
+    echo
+    pick choice "${items[@]}"
+
+    # Пусто (Esc/q) или последний пункт «Назад» — выходим.
+    [ -z "$choice" ] && break
+    [ "$choice" -gt "${#keys[@]}" ] && break
+
+    key="${keys[$((choice - 1))]}"
     state=$(patches_switch_state "$key")
     [ "$state" = "1" ] && new=0 || new=1
     if grep -qE "^$key=" "$env"; then
@@ -826,23 +913,20 @@ patches_menu() {
     else
       echo "Текущее состояние: ${C_YEL}не установлены${C_RESET}"
     fi
-    cat <<'MENU'
-
-  1) Установить / обновить патчи
-  2) Включить / выключить патчи
-  3) Показать статус
-  4) Удалить патчи
-  5) Назад
-
-MENU
+    echo
     local choice=""
-    ask "Выберите пункт [1-5]: " choice
+    pick choice \
+      "Установить / обновить патчи" \
+      "Включить / выключить патчи" \
+      "Показать статус" \
+      "Удалить патчи" \
+      "Назад"
     case "$choice" in
       1) patches_apply       || warn "Установка патчей завершилась с ошибкой." ;;
       2) patches_toggle_menu || warn "Не удалось изменить список патчей." ;;
       3) patches_status ;;
       4) patches_remove ;;
-      5|q|Q|'') return 0 ;;
+      5|'') return 0 ;;
       *) warn "Не понял ответ: $choice" ;;
     esac
   done
@@ -859,20 +943,14 @@ main_menu() {
     else
       echo "Патчи: ${C_YEL}не установлены${C_RESET}"
     fi
-    cat <<'MENU'
-
-  1) Обновить бота
-  2) Управление патчами
-  3) Выход
-
-MENU
+    echo
     local choice=""
-    ask "Выберите пункт [1-3]: " choice
+    pick choice "Обновить бота" "Управление патчами" "Выход"
     case "$choice" in
-      1)        return 0 ;;
-      2)        patches_menu ;;
-      3|q|Q|'') info "Выход."; exit 0 ;;
-      *)        warn "Не понял ответ: $choice" ;;
+      1)   return 0 ;;
+      2)   patches_menu ;;
+      3|'') info "Выход."; exit 0 ;;
+      *)   warn "Не понял ответ: $choice" ;;
     esac
   done
 }
