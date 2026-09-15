@@ -1,0 +1,12 @@
+# Скрипт и патчи выполняются в Linux-контейнере: CR в конце строк ломает и
+# шебанг bash, и разбор manifest.txt. Фиксируем LF независимо от того, на какой
+# системе делается коммит.
+* text=auto eol=lf
+
+bedolaga_updater text eol=lf
+*.sh    text eol=lf
+*.py    text eol=lf
+*.yml   text eol=lf
+*.txt   text eol=lf
+*.env   text eol=lf
+*.example text eol=lf

@@ -13,8 +13,23 @@
 #   4. Делает бэкап БД (pg_dump -Fc) перед каждой устанавливаемой версией.
 #   5. Поэтапно (тег за тегом): сначала собирает образ, не трогая работающие
 #      контейнеры, и только потом перезапускает стек и ждёт healthcheck.
-#   6. Если рядом с ботом есть папка cabinet и бот доведён до последней версии — обновляет её.
-#   7. Чистит неиспользуемые docker-образы и показывает, как смотреть логи.
+#   6. Переустанавливает патчи (наши правки поведения бота), если они стоят.
+#   7. Если рядом с ботом есть папка cabinet и бот доведён до последней версии — обновляет её.
+#   8. Чистит неиспользуемые docker-образы и показывает, как смотреть логи.
+#
+# Команды:
+#   bedolaga_updater            — обновить бота (и переустановить патчи, если стоят)
+#   bedolaga_updater patches    — меню патчей: установить/обновить, статус, удалить
+#   bedolaga_updater --help     — справка
+#
+# Через curl аргументы передаются так:
+#   curl -fsSL .../bedolaga_updater | bash -s -- patches
+#
+# Что такое патчи:
+#   Правки поведения бота, которых нет в апстриме. Живут в $BOT_DIR/patches/ и
+#   подключаются через $BOT_DIR/docker-compose.override.yml. Оба пути git
+#   игнорирует, поэтому `git checkout <тег>` при обновлении их не затирает —
+#   в отличие от прямых правок в файлах бота, которые обновление сносит.
 #
 # Переменные окружения (все опциональны):
 #   BOT_DIR=/path/to/bot     — принудительно указать папку бота
@@ -28,6 +43,9 @@
 #   NO_CONFIRM=1              — не спрашивать подтверждение
 #   SKIP_BACKUP=1            — пропустить бэкапы (НЕ рекомендуется)
 #   DRY_RUN=1                — только показать план, ничего не менять
+#   PATCHES=auto|1|0         — переустанавливать ли патчи после обновления
+#                              (auto = только если уже установлены)
+#   PATCHES_BASE_URL=...     — откуда качать файлы патчей
 
 set -uo pipefail
 
@@ -66,6 +84,45 @@ confirm() {  # confirm "Продолжить?" [default: y]
   # начинающийся с кириллицы, попадал в "да". Сверяем префиксы целиком.
   case "$a" in y*|Y*|д*|Д*) return 0;; *) return 1;; esac
 }
+
+# ------------------------------------------------------------------- аргументы
+# MODE=update  — обычное обновление (в конце патчи переустанавливаются, если стоят)
+# MODE=patches — только работа с патчами, бота не обновляем
+MODE="update"
+PATCHES="${PATCHES:-auto}"   # auto | 1 | 0
+
+usage() {
+  cat <<'USAGE'
+Использование: bedolaga_updater [команда] [ключи]
+
+Команды:
+  (без команды)   Поэтапно обновить бота. Если установлены патчи — в конце
+                  переустановить их под новую версию.
+  patches         Меню патчей: установить/обновить, показать статус, удалить.
+                  Бота при этом не обновляем.
+
+Ключи:
+  --no-patches    Не трогать патчи после обновления.
+  --patches       Переустановить патчи после обновления, даже если раньше их не было.
+  -h, --help      Эта справка.
+
+Через curl:
+  curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/bedolaga_updater | bash
+  curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/bedolaga_updater | bash -s -- patches
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    patches|patch)  MODE="patches" ;;
+    update)         MODE="update" ;;
+    --no-patches)   PATCHES="0" ;;
+    --patches)      PATCHES="1" ;;
+    -h|--help)      usage; exit 0 ;;
+    *)              usage >&2; die "Неизвестный аргумент: $1" ;;
+  esac
+  shift
+done
 
 # ------------------------------------------------------------------ окружение
 DRY_RUN="${DRY_RUN:-0}"
@@ -334,7 +391,229 @@ update_cabinet() {
     || warn "Не удалось обновить Cabinet — проверьте вручную в $cab"
 }
 
+# ==================================================================== патчи
+# Патчи — это наши правки поведения бота, которых нет в апстриме.
+#
+# Ключевое ограничение: обновление делает `git checkout <тег>`, поэтому любая
+# правка в отслеживаемых файлах бота либо потеряется, либо уронит обновление.
+# Поэтому патчи не трогают git-дерево вообще:
+#
+#   $BOT_DIR/patches/                    — наш код (папка не отслеживается git:
+#                                          .gitignore бота начинается с `*`)
+#   $BOT_DIR/docker-compose.override.yml — монтирует patches/ в контейнер и
+#                                          подменяет команду на bootstrap.py,
+#                                          который подключает патчи и запускает
+#                                          штатный main.py
+#
+# Оба пути git игнорирует, `git checkout` их не трогает, docker compose
+# подхватывает override автоматически. Так что после обновления патчи остаются
+# на месте сами; переустановка в конце нужна лишь для того, чтобы подтянуть
+# свежие версии самих патчей.
+
+PATCHES_BASE_URL="${PATCHES_BASE_URL:-https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/patches}"
+PATCH_MARKER="# managed-by: bedolaga_updater patches"
+
+patches_dir()     { echo "$BOT_DIR/patches"; }
+override_file()   { echo "$BOT_DIR/docker-compose.override.yml"; }
+
+patches_installed() {
+  local ovr; ovr="$(override_file)"
+  [ -f "$ovr" ] && grep -qF "$PATCH_MARKER" "$ovr" && [ -f "$(patches_dir)/bootstrap.py" ]
+}
+
+# Скачивает файлы патчей во временный каталог и подменяет ими папку patches/
+# целиком. Целиком — чтобы модуль, удалённый из манифеста, не остался работать.
+# patches.env (настройки администратора) переносится в новую папку как есть.
+patches_fetch() {
+  need_cmd curl
+  local pdir stage rel
+  pdir="$(patches_dir)"
+  stage="$(mktemp -d "$BOT_DIR/.patches_stage.XXXXXX")" || { err "Не удалось создать временную папку."; return 1; }
+
+  info "Скачиваю манифест патчей..."
+  if ! curl -fsSL "$PATCHES_BASE_URL/manifest.txt" -o "$stage/manifest.txt"; then
+    rm -rf "$stage"; err "Не удалось скачать $PATCHES_BASE_URL/manifest.txt"; return 1
+  fi
+
+  while IFS= read -r rel || [ -n "$rel" ]; do
+    rel="${rel%$'\r'}"
+    case "$rel" in ''|'#'*) continue;; esac
+    mkdir -p "$stage/$(dirname "$rel")"
+    info "  ↓ $rel"
+    if ! curl -fsSL "$PATCHES_BASE_URL/$rel" -o "$stage/$rel"; then
+      rm -rf "$stage"; err "Не удалось скачать $rel — папка patches не тронута."; return 1
+    fi
+  done < "$stage/manifest.txt"
+
+  # Настройки администратора переживают обновление патчей.
+  [ -f "$pdir/patches.env" ] && cp -p "$pdir/patches.env" "$stage/patches.env"
+  # Первая установка: заводим patches.env из примера.
+  [ -f "$stage/patches.env" ] || cp "$stage/patches.env.example" "$stage/patches.env"
+
+  rm -rf "$pdir"
+  mv "$stage" "$pdir" || { err "Не удалось переместить $stage → $pdir"; return 1; }
+  # Внутри контейнера бот работает под uid 1000 и монтирует папку read-only.
+  chmod -R a+rX "$pdir"
+  ok "Файлы патчей обновлены: ${pdir#$BOT_DIR/}/"
+}
+
+patches_write_override() {
+  local ovr; ovr="$(override_file)"
+
+  if [ -f "$ovr" ] && ! grep -qF "$PATCH_MARKER" "$ovr"; then
+    warn "В папке бота уже есть docker-compose.override.yml, созданный не этим скриптом."
+    warn "Скрипт не умеет сливать его со своим — придётся выбрать."
+    confirm "Перезаписать его (копия останется рядом с суффиксом .bak-<дата>)?" n \
+      || { err "Оставил чужой override нетронутым. Патчи не подключены."; return 1; }
+    cp -p "$ovr" "$ovr.bak-$(date +%Y%m%d_%H%M%S)"
+  fi
+
+  cat > "$ovr" <<YAML
+$PATCH_MARKER
+# Файл создан скриптом bedolaga_updater и им же управляется.
+# Он подключает патчи из ./patches, не меняя ни одного файла бота.
+# Убрать патчи:  bedolaga_updater patches  →  «Удалить патчи»
+#
+# BEDOLAGA_PATCHES=0 отключает патчи, не удаляя их (полезно для диагностики:
+# так можно проверить, виноват ли патч в проблеме).
+services:
+  bot:
+    volumes:
+      - ./patches:/app/patches:ro
+    environment:
+      BEDOLAGA_PATCHES: '1'
+      BEDOLAGA_APP_DIR: /app
+    command: ['python', '/app/patches/bootstrap.py']
+YAML
+  ok "docker-compose.override.yml записан."
+}
+
+# Патчи печатают строку о подключении в самом начале лога контейнера.
+patches_verify() {
+  local logs line
+  logs=$(docker logs "$BOT_CONTAINER" 2>&1 | head -n 300 || true)
+  line=$(echo "$logs" | grep -F '[bedolaga-patches]' | head -n 5 || true)
+  if [ -z "$line" ]; then
+    warn "В логах контейнера не видно ни одной строки [bedolaga-patches]."
+    warn "Проверьте вручную: docker logs $BOT_CONTAINER | grep bedolaga-patches"
+    return 1
+  fi
+  echo "$line" | sed 's/^/   /'
+  if echo "$line" | grep -q 'подключены патчи'; then
+    ok "Патчи подключены."
+    return 0
+  fi
+  warn "Патчи загрузились с ошибкой — бот работает, но правки не применились."
+  return 1
+}
+
+patches_apply() {
+  step "🧩 Патчи: установка / обновление"
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "  [dry-run] скачивание патчей, запись override и перезапуск пропущены"
+    return 0
+  fi
+  patches_fetch          || return 1
+  patches_write_override || return 1
+
+  info "Перезапускаю бота с патчами..."
+  ( cd "$BOT_DIR" && DC up -d ) || { err "docker compose up завершился ошибкой."; return 1; }
+  wait_healthy 600 || { err "Контейнер не поднялся после подключения патчей."; return 1; }
+  patches_verify
+}
+
+patches_remove() {
+  step "🧹 Патчи: удаление"
+  local ovr pdir; ovr="$(override_file)"; pdir="$(patches_dir)"
+
+  if [ -f "$ovr" ] && grep -qF "$PATCH_MARKER" "$ovr"; then
+    [ "$DRY_RUN" = "1" ] || rm -f "$ovr"
+    ok "Удалён docker-compose.override.yml."
+  else
+    info "Нашего docker-compose.override.yml нет — удалять нечего."
+  fi
+
+  if [ -d "$pdir" ]; then
+    if confirm "Удалить и папку patches? В ней лежит ваш patches.env с настройками." n; then
+      [ "$DRY_RUN" = "1" ] || rm -rf "$pdir"
+      ok "Папка patches удалена."
+    else
+      info "Папка patches оставлена. Без override она не подключается."
+    fi
+  fi
+
+  info "Таблицы patch_connect_reminders* остаются в БД: боту они не мешают,"
+  info "а при повторной установке патчей история отправок не потеряется."
+
+  if [ "$DRY_RUN" != "1" ]; then
+    info "Перезапускаю бота в штатной конфигурации..."
+    ( cd "$BOT_DIR" && DC up -d ) && wait_healthy 600 \
+      && ok "Бот работает без патчей." \
+      || warn "Проверьте состояние контейнера вручную."
+  fi
+}
+
+patches_status() {
+  step "🧩 Патчи: статус"
+  local ovr pdir; ovr="$(override_file)"; pdir="$(patches_dir)"
+
+  if patches_installed; then
+    ok "Патчи установлены."
+  else
+    warn "Патчи не установлены."
+  fi
+  echo "  override : $([ -f "$ovr" ] && echo "$ovr" || echo '— нет')"
+  echo "  папка    : $([ -d "$pdir" ] && echo "$pdir" || echo '— нет')"
+  if [ -d "$pdir" ]; then
+    echo "  файлы    :"
+    ( cd "$pdir" && find . -name '*.py' -o -name 'patches.env' | sed 's|^\./|     |' | sort )
+  fi
+  if [ -f "$pdir/patches.env" ]; then
+    echo "  настройки:"
+    grep -E '^[A-Z0-9_]+=' "$pdir/patches.env" | sed 's/^/     /'
+  fi
+  if docker ps --format '{{.Names}}' | grep -qx "$BOT_CONTAINER"; then
+    echo "  в логах  :"
+    patches_verify || true
+  else
+    warn "Контейнер $BOT_CONTAINER не запущен — логи не смотрю."
+  fi
+}
+
+patches_menu() {
+  while :; do
+    step "🧩 Патчи Bedolaga"
+    if patches_installed; then
+      echo "Текущее состояние: ${C_GRN}установлены${C_RESET}"
+    else
+      echo "Текущее состояние: ${C_YEL}не установлены${C_RESET}"
+    fi
+    cat <<'MENU'
+
+  1) Установить / обновить патчи
+  2) Показать статус
+  3) Удалить патчи
+  4) Выход
+
+MENU
+    local choice=""
+    ask "Выберите пункт [1-4]: " choice
+    case "$choice" in
+      1) patches_apply  || warn "Установка патчей завершилась с ошибкой." ;;
+      2) patches_status ;;
+      3) patches_remove ;;
+      4|q|Q|'') return 0 ;;
+      *) warn "Не понял ответ: $choice" ;;
+    esac
+  done
+}
+
 # =============================================================== основной поток
+if [ "$MODE" = "patches" ]; then
+  patches_menu
+  exit 0
+fi
+
 step "🚀 Bedolaga Bot — поэтапное обновление"
 
 info "Получаю свежие теги..."
@@ -406,6 +685,35 @@ else
   ok "Бот обновлён до версии $LATEST"
 fi
 
+# ------------------------------------------------------- переустановка патчей
+# Сами патчи обновление пережили: и patches/, и override лежат вне git-дерева.
+# Здесь мы лишь подтягиваем их свежие версии — на случай, если новая версия
+# бота потребовала правок в самих патчах.
+PATCHES_FAILED=0
+case "$PATCHES" in
+  0)
+    if patches_installed; then
+      warn "Патчи установлены, но переустановку пропускаю (--no-patches)."
+      warn "Работать они продолжают — на боте сейчас их прежняя версия."
+    fi
+    ;;
+  1)
+    patches_apply || PATCHES_FAILED=1
+    ;;
+  *)  # auto
+    if patches_installed; then
+      info "Обнаружены установленные патчи — обновляю их под новую версию бота."
+      patches_apply || PATCHES_FAILED=1
+    else
+      info "Патчи не установлены — пропускаю. Поставить: bedolaga_updater patches"
+    fi
+    ;;
+esac
+if [ "$PATCHES_FAILED" = "1" ]; then
+  warn "Патчи переустановить не удалось. Бот обновлён и работает;"
+  warn "разберитесь с патчами отдельно: bedolaga_updater patches"
+fi
+
 # Cabinet обновляем, когда бот доведён до последней версии
 if [ "$LATEST" = "${ALL[-1]}" ]; then
   update_cabinet
@@ -445,3 +753,24 @@ cat <<EOF
       pg_restore -U $PG_USER -d $PG_DB --clean --if-exists
 
 EOF
+
+if patches_installed; then
+  cat <<EOF
+Патчи установлены. Их настройки:
+
+  ${C_BOLD}$BOT_DIR/patches/patches.env${C_RESET}
+
+После правки настроек перезапустите бота:
+
+  cd "$BOT_DIR" && docker compose up -d
+
+Логи патчей:
+
+  docker logs $BOT_CONTAINER | grep bedolaga-patches
+
+Управление патчами (установить/статус/удалить):
+
+  curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/bedolaga_updater | bash -s -- patches
+
+EOF
+fi

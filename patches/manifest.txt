@@ -1,0 +1,11 @@
+# Файлы, которые bedolaga_updater скачивает в $BOT_DIR/patches/.
+# По одному пути в строке, относительно patches/ в этом репозитории.
+# Пустые строки и строки с # игнорируются.
+#
+# patches.env НЕ входит в список намеренно: он создаётся один раз из
+# patches.env.example и дальше принадлежит администратору.
+bootstrap.py
+patches.env.example
+bedolaga_patches/__init__.py
+bedolaga_patches/config.py
+bedolaga_patches/connect_reminder.py
