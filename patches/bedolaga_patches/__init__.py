@@ -24,6 +24,7 @@ __all__ = ['PATCH_MODULES', 'enabled_flag', 'install', 'is_enabled']
 PATCH_MODULES = (
     ('connect_reminder', 'Инструкция по подключению, если за 10 минут не подключился'),
     ('contest_report', 'Отчёт по рефералам для конкурса в админ-панели'),
+    ('shop_button', 'Кнопка магазина внизу главного меню'),
 )
 
 

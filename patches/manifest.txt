@@ -10,3 +10,4 @@ bedolaga_patches/__init__.py
 bedolaga_patches/config.py
 bedolaga_patches/connect_reminder.py
 bedolaga_patches/contest_report.py
+bedolaga_patches/shop_button.py
