@@ -3,11 +3,13 @@
 Возможности:
   * Кнопка «🏆 Конкурс рефералов» в админ-панели — добавляется обёрткой вокруг
     клавиатуры, правки файлов бота не нужны.
-  * Пресеты периода (7 / 30 дней, текущий / прошлый месяц) и свой период.
+  * Пресеты периода (7 / 30 дней, текущий / прошлый месяц) и свой период;
+    последние введённые вручную периоды предлагаются кнопками.
   * Переключаемая сортировка топа: по оплатам (умолч.) / приглашённым / доходу.
   * Статистика по конкретному пользователю (@username или telegram_id).
+  * CSV со сводкой и детализацией — по кнопке, а не автоматически.
   * Генерация списка билетов для розыгрыша: 1 билет = 1 реферал с покупкой либо
-    1 приглашённый; в файле только @username, повторённый по числу билетов.
+    1 приглашённый; участник в файле — @username, а если его нет, то id.
   * Команда: /contest_report [НАЧАЛО КОНЕЦ tz= min= top= scope=]
 
 Что считается:
@@ -20,7 +22,12 @@
   * «Доход»     — сумма всех реальных завершённых пополнений этих рефералов
                   внутри периода.
 
-Патч только ЧИТАЕТ базу (SELECT). Ничего не пишет и не меняет.
+Данные бота патч только ЧИТАЕТ (SELECT) — ничего в них не пишет и не меняет.
+Пишет он лишь в собственную таблицу `patch_contest_report_periods` (история
+введённых вручную периодов), о которой alembic бота не знает.
+
+Агрегат за период кешируется на короткое время: смена сортировки, выгрузка CSV
+и оба вида билетов иначе гоняли бы один и тот же тяжёлый запрос заново.
 
 Как встраивается
 ----------------
@@ -33,10 +40,12 @@
 """
 
 import csv
+import hashlib
 import html
 import io
 import sys
 from datetime import datetime, timedelta, timezone
+from time import monotonic
 
 import structlog
 from aiogram import Dispatcher, F, types
@@ -69,6 +78,10 @@ NON_REAL_METHODS = config.get_list('PATCH_CONTEST_REPORT_NON_REAL_METHODS', ['ma
 MENU_BUTTON_TEXT = config.get_str('PATCH_CONTEST_REPORT_BUTTON_TEXT', '🏆 Конкурс рефералов')
 # Кнопка админ-меню, под которую встаёт наша: «💰 Промокоды/Статистика».
 ADMIN_ANCHOR_CALLBACK = config.get_str('PATCH_CONTEST_REPORT_ANCHOR', 'admin_submenu_promo')
+# Сколько последних периодов, введённых вручную, предлагать кнопками.
+RECENT_PERIODS = config.get_int('PATCH_CONTEST_REPORT_RECENT_PERIODS', 3, minimum=0, maximum=10)
+# Сколько разных периодов держать в кеше одновременно.
+CACHE_MAX_ENTRIES = 4
 # ------------------------------------------------------------------------------
 
 if DEFAULT_SCOPE not in ('period', 'all'):
@@ -195,12 +208,18 @@ def _menu_kb():
     )
 
 
-def _cancel_kb():
+def _cancel_kb(recent=None):
     """Экранам ввода нужен выход: без него из них выбирались только текстом
-    или /start, а брошенное состояние съедало следующее сообщение админа."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text='⬅️ Отмена', callback_data='contest_report_menu')]]
-    )
+    или /start, а брошенное состояние съедало следующее сообщение админа.
+
+    На экране «свой период» сверху идут кнопки с последними введёнными
+    периодами, чтобы не набирать одно и то же заново.
+    """
+    rows = []
+    for key, raw in recent or []:
+        rows.append([InlineKeyboardButton(text=f'🔁 {raw}'[:64], callback_data=f'crperiod:{key}')])
+    rows.append([InlineKeyboardButton(text='⬅️ Отмена', callback_data='contest_report_menu')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _report_kb(active_sort):
@@ -243,6 +262,67 @@ def _excluded_query(inner_sql):
 
 
 async def _run_report(db, start_utc, end_utc, min_kopeks, scope, sort):
+    """Агрегат за период, отсортированный по `sort`.
+
+    Сортировка данных не меняет, поэтому кешируем сам агрегат: смена сортировки,
+    выгрузка CSV и оба вида билетов гоняли один и тот же запрос заново — на
+    большой базе это заметно.
+    """
+    key = (start_utc.isoformat(), end_utc.isoformat(), min_kopeks, scope)
+    cached = _cache_get(key)
+    if cached is None:
+        cached = await _collect(db, start_utc, end_utc, min_kopeks, scope)
+        _cache_put(key, cached)
+    referrers, detail = cached
+
+    keys = SORT_KEYS.get(sort, SORT_KEYS[DEFAULT_SORT])
+    ranking = sorted(referrers, key=lambda x: tuple(x[k] for k in keys), reverse=True)
+    return ranking, detail
+
+
+# Кеш агрегатов: ключ → (момент, (referrers, detail)). Записей мало и живут
+# недолго — отчёт открывают сериями по одному периоду, а между сериями данные
+# должны быть свежими.
+_CACHE: dict = {}
+
+
+def _cache_ttl() -> int:
+    return config.get_int('PATCH_CONTEST_REPORT_CACHE_SECONDS', 120, minimum=0, maximum=3600)
+
+
+def _cache_get(key):
+    ttl = _cache_ttl()
+    if ttl <= 0:
+        return None
+    item = _CACHE.get(key)
+    if not item:
+        return None
+    born, value = item
+    if monotonic() - born > ttl:
+        _CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _cache_put(key, value) -> None:
+    if _cache_ttl() <= 0:
+        return
+    now = monotonic()
+    # Подчищаем протухшее и держим размер в узде: в кеше лежат полные списки
+    # рефералов, и на годовом периоде это уже мегабайты.
+    for stale in [k for k, (born, _) in _CACHE.items() if now - born > _cache_ttl()]:
+        _CACHE.pop(stale, None)
+    while len(_CACHE) >= CACHE_MAX_ENTRIES:
+        _CACHE.pop(next(iter(_CACHE)))
+    _CACHE[key] = (now, value)
+
+
+def cache_clear() -> None:
+    """Сбросить кеш. Нужен тестам и ручной отладке."""
+    _CACHE.clear()
+
+
+async def _collect(db, start_utc, end_utc, min_kopeks, scope):
     sqlite = settings.is_sqlite()
     params = {
         'start': _bind_dt(start_utc, sqlite),
@@ -313,9 +393,7 @@ async def _run_report(db, start_utc, end_utc, min_kopeks, scope, sort):
             agg['purchased'] += 1
         agg['revenue_kopeks'] += int(row['revenue_kopeks'] or 0)
 
-    keys = SORT_KEYS.get(sort, SORT_KEYS[DEFAULT_SORT])
-    ranking = sorted(referrers.values(), key=lambda x: tuple(x[k] for k in keys), reverse=True)
-    return ranking, detail
+    return list(referrers.values()), detail
 
 
 def _build_csv(ranking, detail):
@@ -368,21 +446,146 @@ def _build_csv(ranking, detail):
     return buf.getvalue().encode('utf-8-sig')
 
 
+# ---------- История введённых вручную периодов -------------------------------
+# Единственное, что патч пишет в базу: своя таблица с префиксом patch_, о
+# которой alembic бота не знает. Нужна, чтобы не набирать один и тот же период
+# заново — кнопки с ним появляются на экране «Свой период».
+
+_periods_table_ready = False
+
+
+async def _ensure_periods_table() -> None:
+    global _periods_table_ready
+    if _periods_table_ready:
+        return
+
+    from app.database.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            text("""
+                CREATE TABLE IF NOT EXISTS patch_contest_report_periods (
+                    admin_id BIGINT NOT NULL,
+                    key VARCHAR(16) NOT NULL,
+                    raw VARCHAR(255) NOT NULL,
+                    used_at TIMESTAMP NOT NULL,
+                    PRIMARY KEY (admin_id, key)
+                )
+            """)
+        )
+        await db.commit()
+
+    _periods_table_ready = True
+
+
+def _period_key(raw: str) -> str:
+    return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
+
+
+async def _remember_period(admin_id: int, raw: str) -> None:
+    """Запомнить удачно разобранный ввод. Сбой записи молча игнорируем:
+    история — удобство, из-за неё отчёт падать не должен."""
+    if not admin_id or RECENT_PERIODS <= 0:
+        return
+    raw = raw.strip()[:255]
+    if not raw:
+        return
+
+    try:
+        await _ensure_periods_table()
+
+        from app.database.database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                text("""
+                    INSERT INTO patch_contest_report_periods (admin_id, key, raw, used_at)
+                    VALUES (:admin_id, :key, :raw, :used_at)
+                    ON CONFLICT (admin_id, key) DO UPDATE
+                        SET raw = EXCLUDED.raw, used_at = EXCLUDED.used_at
+                """),
+                {
+                    'admin_id': admin_id,
+                    'key': _period_key(raw),
+                    'raw': raw,
+                    'used_at': datetime.now(timezone.utc).replace(tzinfo=None),
+                },
+            )
+            await db.commit()
+    except Exception as error:  # noqa: BLE001
+        logger.warning('contest_report: не удалось запомнить период', error=str(error))
+
+
+async def _recent_periods(admin_id: int) -> list[tuple[str, str]]:
+    """Последние введённые периоды как список (key, raw)."""
+    if not admin_id or RECENT_PERIODS <= 0:
+        return []
+    try:
+        await _ensure_periods_table()
+
+        from app.database.database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                text("""
+                    SELECT key, raw FROM patch_contest_report_periods
+                    WHERE admin_id = :admin_id
+                    ORDER BY used_at DESC
+                    LIMIT :limit
+                """),
+                {'admin_id': admin_id, 'limit': RECENT_PERIODS},
+            )
+            return [(row[0], row[1]) for row in result.all()]
+    except Exception as error:  # noqa: BLE001
+        logger.warning('contest_report: не удалось прочитать историю периодов', error=str(error))
+        return []
+
+
+async def _period_by_key(admin_id: int, key: str) -> str | None:
+    try:
+        await _ensure_periods_table()
+
+        from app.database.database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                text('SELECT raw FROM patch_contest_report_periods WHERE admin_id = :a AND key = :k'),
+                {'a': admin_id, 'k': key},
+            )
+            return result.scalar_one_or_none()
+    except Exception as error:  # noqa: BLE001
+        logger.warning('contest_report: не удалось найти период', error=str(error))
+        return None
+
+
+def _raffle_name(r) -> str:
+    """Как участник записан в файле билетов.
+
+    Раньше тех, у кого нет @username, просто выбрасывали — человек выигрывал
+    конкурс, но в розыгрыше не участвовал. Теперь они идут по Telegram ID:
+    победителя по нему находит и админка, и поиск в боте.
+    """
+    if r['username']:
+        return '@' + r['username']
+    if r['referrer_tg']:
+        return f'id{r["referrer_tg"]}'
+    return f'user{r["referrer_id"]}'
+
+
 def _build_raffle(ranking, mode):
-    """mode: paid|invited. Возвращает (текст_файла, билетов, участников, пропущено_без_username)."""
+    """mode: paid|invited. Возвращает (текст_файла, билетов, участников, без_username)."""
     lines = []
     participants = 0
-    skipped = 0
+    without_username = 0
     for r in ranking:
         tickets = r['purchased'] if mode == 'paid' else r['invited']
         if tickets <= 0:
             continue
         if not r['username']:
-            skipped += 1
-            continue
+            without_username += 1
         participants += 1
-        lines.extend(['@' + r['username']] * tickets)
-    return '\n'.join(lines) + ('\n' if lines else ''), len(lines), participants, skipped
+        lines.extend([_raffle_name(r)] * tickets)
+    return '\n'.join(lines) + ('\n' if lines else ''), len(lines), participants, without_username
 
 
 def _format_report_text(ranking, start_utc, end_utc, min_rub, scope, top, sort, label=None):
@@ -513,14 +716,41 @@ async def run_preset_callback(callback: types.CallbackQuery, db_user: User, db: 
 @error_handler
 async def ask_custom_callback(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
     await state.set_state(ContestReportStates.waiting_period)
-    await callback.message.edit_text(
+    recent = await _recent_periods(db_user.telegram_id)
+    hint = (
         '✏️ Пришлите период одним сообщением:\n\n'
         '<code>ГГГГ-ММ-ДД ГГГГ-ММ-ДД</code>\nнапример: <code>2026-06-01 2026-06-30</code>\n\n'
-        'Доп. параметры: <code>min=100 tz=3 top=20 scope=period</code>',
-        reply_markup=_cancel_kb(),
-        parse_mode='HTML',
+        'Доп. параметры: <code>min=100 tz=3 top=20 scope=period</code>'
     )
+    if recent:
+        hint += '\n\nИли повторите один из прошлых — кнопками ниже.'
+    await callback.message.edit_text(hint, reply_markup=_cancel_kb(recent), parse_mode='HTML')
     await callback.answer()
+
+
+@admin_required
+@error_handler
+async def recent_period_callback(
+    callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext
+):
+    raw = await _period_by_key(db_user.telegram_id, callback.data.split(':', 1)[1])
+    if not raw:
+        await callback.answer('Этот период уже не сохранён, введите заново', show_alert=True)
+        return
+
+    ok, payload = _parse_command_args(raw)
+    if not ok:
+        await callback.answer(f'Не смог разобрать сохранённый период: {payload}', show_alert=True)
+        return
+
+    await state.set_state(None)
+    await callback.answer('Считаю…')
+    start_utc, end_utc, min_kopeks, min_rub, scope, top = payload
+    await _remember_period(db_user.telegram_id, raw)
+    await _generate_and_send(
+        callback.message, db, db_user.telegram_id, state,
+        start_utc, end_utc, min_kopeks, min_rub, scope, top, DEFAULT_SORT,
+    )
 
 
 @admin_required
@@ -533,6 +763,7 @@ async def process_custom_period(message: types.Message, db_user: User, db: Async
         return
     start_utc, end_utc, min_kopeks, min_rub, scope, top = payload
     await message.answer('⏳ Считаю…')
+    await _remember_period(db_user.telegram_id, message.text or '')
     await _generate_and_send(
         message, db, db_user.telegram_id, state, start_utc, end_utc, min_kopeks, min_rub, scope, top, DEFAULT_SORT
     )
@@ -584,9 +815,9 @@ async def raffle_callback(callback: types.CallbackQuery, db_user: User, db: Asyn
     mode = callback.data.split(':', 1)[1]  # paid | invited
     await callback.answer('Готовлю билеты…')
     ranking, _ = await _run_report(db, cr['start_utc'], cr['end_utc'], cr['min_kopeks'], cr['scope'], 'paid')
-    content, tickets, participants, skipped = _build_raffle(ranking, mode)
+    content, tickets, participants, without_username = _build_raffle(ranking, mode)
     if tickets == 0:
-        await callback.message.answer('Нет подходящих участников с @username для розыгрыша.')
+        await callback.message.answer('За этот период участников для розыгрыша нет.')
         return
     basis = 'с покупкой' if mode == 'paid' else 'приглашённых'
     fname = f'raffle_{mode}_{cr["start_utc"].strftime("%Y%m%d")}_{cr["end_utc"].strftime("%Y%m%d")}.txt'
@@ -594,8 +825,8 @@ async def raffle_callback(callback: types.CallbackQuery, db_user: User, db: Asyn
         f'🎟 Билеты для розыгрыша (1 билет = 1 реферал {basis}).\n'
         f'Участников: {participants} · Билетов (строк): {tickets}'
     )
-    if skipped:
-        caption += f'\n⚠️ Пропущено без @username: {skipped}'
+    if without_username:
+        caption += f'\nБез @username — записаны по id: {without_username}'
     await callback.message.answer_document(
         types.BufferedInputFile(content.encode('utf-8'), filename=fname), caption=caption
     )
@@ -746,6 +977,7 @@ async def cmd_contest_report(message: types.Message, db_user: User, db: AsyncSes
         return
     start_utc, end_utc, min_kopeks, min_rub, scope, top = payload
     await message.answer('⏳ Считаю…')
+    await _remember_period(db_user.telegram_id, raw)
     await _generate_and_send(
         message, db, db_user.telegram_id, state, start_utc, end_utc, min_kopeks, min_rub, scope, top, DEFAULT_SORT
     )
@@ -851,6 +1083,7 @@ def _register_handlers(dp: Dispatcher) -> None:
     dp.callback_query.register(resort_callback, F.data.startswith('crsort:'))
     dp.callback_query.register(raffle_callback, F.data.startswith('crraffle:'))
     dp.callback_query.register(csv_callback, F.data == 'crcsv')
+    dp.callback_query.register(recent_period_callback, F.data.startswith('crperiod:'))
     dp.message.register(process_custom_period, ContestReportStates.waiting_period)
     dp.message.register(process_userstats, ContestReportStates.waiting_user)
     dp.message.register(cmd_contest_report, Command('contest_report'))
