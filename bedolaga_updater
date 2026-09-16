@@ -10,12 +10,13 @@
 #   1. Сам находит папку бота (по label запущенного контейнера remnawave_bot или по CWD).
 #   2. Определяет текущую версию (из .release-please-manifest.json / pyproject / git-тега).
 #   3. Проверяет свободное место на диске перед стартом.
-#   4. Делает бэкап БД (pg_dump -Fc) перед каждой устанавливаемой версией.
-#   5. Поэтапно (тег за тегом): сначала собирает образ, не трогая работающие
+#   4. Включает режим техработ на время работ и выключает его в конце.
+#   5. Делает бэкап БД (pg_dump -Fc) перед каждой устанавливаемой версией.
+#   6. Поэтапно (тег за тегом): сначала собирает образ, не трогая работающие
 #      контейнеры, и только потом перезапускает стек и ждёт healthcheck.
-#   6. Переустанавливает патчи (наши правки поведения бота), если они стоят.
-#   7. Если рядом с ботом есть папка cabinet и бот доведён до последней версии — обновляет её.
-#   8. Чистит неиспользуемые docker-образы и показывает, как смотреть логи.
+#   7. Переустанавливает патчи (наши правки поведения бота), если они стоят.
+#   8. Если рядом с ботом есть папка cabinet и бот доведён до последней версии — обновляет её.
+#   9. Чистит неиспользуемые docker-образы и показывает, как смотреть логи.
 #
 # Команды:
 #   bedolaga_updater            — меню: обновить бота / управлять патчами
@@ -52,6 +53,9 @@
 #   PATCHES_BASE_URL=...     — откуда качать файлы патчей
 #   PLAIN_MENU=1             — меню без стрелок, ввод номера пункта
 #                              (включается само, если терминала нет)
+#   MAINTENANCE=1            — включать режим техработ на время обновления
+#                              (0 = не трогать)
+#   REDIS_CONTAINER=...      — переопределить контейнер Redis
 
 set -uo pipefail
 
@@ -67,8 +71,10 @@ else
 fi
 
 # Прерывание в момент, когда курсор спрятан, оставило бы его невидимым до конца
-# сессии — возвращаем его на любом выходе.
-trap 'printf "%s" "$C_SHOW"' EXIT
+# сессии — возвращаем его на любом выходе. Заодно предупреждаем, если обновление
+# оборвалось с включёнными техработами (функция появится ниже по файлу — при
+# раннем падении её ещё нет, поэтому проверяем).
+trap 'printf "%s" "$C_SHOW"; declare -F maintenance_warn_if_left_on >/dev/null 2>&1 && maintenance_warn_if_left_on' EXIT
 
 info()  { echo "${C_BLU}ℹ️  $*${C_RESET}"; }
 ok()    { echo "${C_GRN}✅ $*${C_RESET}"; }
@@ -290,6 +296,8 @@ usage() {
   update          Сразу обновить бота, без меню.
   patches         Сразу открыть меню патчей: установить/обновить,
                   включить/выключить, статус, удалить. Бота не обновляем.
+  maintenance-off Выключить режим техработ и перезапустить бота. Нужна, если
+                  обновление оборвалось и техработы остались включёнными.
 
 Ключи:
   --no-patches    Не трогать патчи после обновления.
@@ -306,6 +314,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     patches|patch)  MODE="patches" ;;
     update)         MODE="update" ;;
+    maintenance-off|maint-off) MODE="maintenance-off" ;;
     --no-patches)   PATCHES="0" ;;
     --patches)      PATCHES="1" ;;
     -h|--help)      usage; exit 0 ;;
@@ -441,6 +450,146 @@ ensure_db() {
     ask "  База данных [$PG_DB]: "               _d; [ -n "${_d:-}" ] && PG_DB="$_d"
   done
   ok "БД доступна: контейнер='$PG_CONTAINER' user='$PG_USER' db='$PG_DB'"
+}
+
+# ------------------------------------------------------------- режим техработ
+# На время обновления бота пользователям показывается «ведутся техработы».
+#
+# Почему пишем сразу в двух местах. Признак включённости бот держит в настройке
+# MAINTENANCE_MODE (таблица system_settings), но при старте он НЕ синхронизирует
+# по ней своё состояние: sync_with_settings дёргается только из кабинета и
+# Web API. В память состояние поднимается из Redis-ключа maintenance_status,
+# причём ручной режим восстанавливается лишь тогда, когда настройка тоже
+# говорит «включено». Так что одной записи мало ни в БД, ни в Redis — бот сам
+# хранит ручные техработы именно этой парой, её и воспроизводим.
+#
+# Web API подошёл бы лучше (он применяет настройку на лету), но его токены
+# лежат в базе хешированными, а в .env токена может не быть вовсе.
+
+MAINTENANCE="${MAINTENANCE:-1}"     # 1 — включать техработы на время обновления
+MAINT_ENABLED_BY_US=0               # мы ли их включили (и значит, нам выключать)
+REDIS_CONTAINER="${REDIS_CONTAINER:-remnawave_bot_redis}"
+
+detect_redis() {
+  docker ps --format '{{.Names}}' | grep -qx "$REDIS_CONTAINER" && return 0
+  local proj found
+  proj=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$BOT_CONTAINER" 2>/dev/null)
+  if [ -n "$proj" ]; then
+    found=$(docker ps --filter "label=com.docker.compose.project=$proj" \
+                      --filter "label=com.docker.compose.service=redis" \
+                      --format '{{.Names}}' | head -n1)
+    [ -n "$found" ] && REDIS_CONTAINER="$found" && return 0
+  fi
+  return 1
+}
+
+psql_q() {  # psql_q SQL → результат без оформления
+  docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/dev/null
+}
+
+# on | off | unknown
+maintenance_state() {
+  local v
+  v=$(psql_q "SELECT value FROM system_settings WHERE key = 'MAINTENANCE_MODE'") || { echo unknown; return; }
+  case "$(echo "$v" | tr -d '[:space:]' | tr 'A-Z' 'a-z')" in
+    true|1|yes|on) echo on ;;
+    false|0|no|off) echo off ;;
+    '') echo off ;;   # строки нет — значит дефолт из .env, а он false
+    *) echo unknown ;;
+  esac
+}
+
+maintenance_set_db() {  # maintenance_set_db true|false
+  psql_q "INSERT INTO system_settings (key, value, created_at, updated_at)
+          VALUES ('MAINTENANCE_MODE', '$1', now(), now())
+          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()" >/dev/null
+}
+
+# Порядок важен: сначала Redis, потом настройка, и откат при сбое на половине.
+# Иначе осталось бы противоречие — настройка говорит «техработы», кеша нет, бот
+# их не показывает, а кабинет при первом же сохранении настроек включит их
+# будто сам по себе.
+maintenance_apply() {  # maintenance_apply on|off
+  local want="$1" json
+
+  if ! detect_redis; then
+    err "Контейнер Redis не найден — применять состояние техработ некуда."
+    return 1
+  fi
+
+  if [ "$want" = "on" ]; then
+    # TTL с запасом: у бота он час, а длинная цепочка версий ставится дольше.
+    printf -v json '{"is_active": true, "enabled_at": "%s", "reason": "Обновление бота (bedolaga_updater)", "auto_enabled": false, "consecutive_failures": 0, "last_check": null}' \
+      "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+    docker exec "$REDIS_CONTAINER" redis-cli SET maintenance_status "$json" EX 21600 >/dev/null 2>&1 \
+      || { err "Не удалось записать состояние техработ в Redis."; return 1; }
+
+    if ! maintenance_set_db true; then
+      err "Не удалось записать MAINTENANCE_MODE в system_settings."
+      docker exec "$REDIS_CONTAINER" redis-cli DEL maintenance_status >/dev/null 2>&1 || true
+      return 1
+    fi
+  else
+    docker exec "$REDIS_CONTAINER" redis-cli DEL maintenance_status >/dev/null 2>&1 \
+      || warn "Не удалось убрать состояние техработ из Redis."
+    maintenance_set_db false \
+      || { err "Не удалось записать MAINTENANCE_MODE в system_settings."; return 1; }
+  fi
+}
+
+maintenance_begin() {
+  [ "$MAINTENANCE" = "1" ] || { info "Техработы не трогаю (MAINTENANCE=0)."; return 0; }
+  [ "$DRY_RUN" = "1" ] && { echo "  [dry-run] включение техработ пропущено"; return 0; }
+
+  local state; state="$(maintenance_state)"
+  case "$state" in
+    on)
+      info "Техработы уже включены — оставляю как есть и в конце не выключаю."
+      return 0
+      ;;
+    unknown)
+      warn "Не удалось понять, включены ли техработы. Обновление продолжу без них."
+      return 0
+      ;;
+  esac
+
+  info "Включаю режим техработ на время обновления..."
+  if maintenance_apply on; then
+    MAINT_ENABLED_BY_US=1
+    ok "Техработы включены. Пользователи увидят их при первом же перезапуске бота."
+  else
+    warn "Включить техработы не удалось — обновление пойдёт без них."
+    confirm "Продолжить обновление без режима техработ?" || die "Остановлено пользователем."
+  fi
+}
+
+maintenance_end() {
+  [ "$MAINT_ENABLED_BY_US" = "1" ] || return 0
+  [ "$DRY_RUN" = "1" ] && return 0
+
+  step "🔧 Выключаю режим техработ"
+  if maintenance_apply off; then
+    MAINT_ENABLED_BY_US=0
+    # В памяти работающего бота техработы всё ещё включены: настройку и кеш он
+    # перечитывает только на старте, поэтому нужен перезапуск.
+    if bot_restart; then
+      ok "Техработы выключены, бот работает в обычном режиме."
+    else
+      warn "Бот не поднялся после выключения техработ — проверьте вручную."
+    fi
+  else
+    err "Не удалось выключить техработы. Сделайте это вручную в админке бота."
+  fi
+}
+
+# Обновление может оборваться на любом шаге. Оставлять пользователей в
+# техработах молча нельзя — предупреждаем и даём точную команду.
+maintenance_warn_if_left_on() {
+  [ "$MAINT_ENABLED_BY_US" = "1" ] || return 0
+  echo >&2
+  warn "ВНИМАНИЕ: режим техработ остался ВКЛЮЧЁННЫМ."
+  warn "Выключите его в админке бота (Настройки → MAINTENANCE_MODE) или командой:"
+  warn "  curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/bedolaga_updater | bash -s -- maintenance-off"
 }
 
 # --------------------------------------------------------- проверка места на ФС
@@ -791,7 +940,7 @@ patches_toggle_menu() {
     return 0
   fi
   if confirm "Перезапустить бота, чтобы изменения вступили в силу?"; then
-    patches_restart || return 1
+    bot_restart || return 1
     patches_verify
   else
     warn "Пока бот не перезапущен, список патчей не изменился."
@@ -895,7 +1044,7 @@ bot_service() {
 # отвечает «up-to-date», оставляя работать старый процесс со старым кодом.
 # Поэтому сервис бота пересоздаём принудительно. Зависимости (postgres, redis)
 # поднимает первый up -d, а --no-deps во втором не даёт их пересоздать.
-patches_restart() {
+bot_restart() {
   local svc; svc="$(bot_service)"
   ( cd "$BOT_DIR" && DC up -d ) || { err "docker compose up завершился ошибкой."; return 1; }
   if ! ( cd "$BOT_DIR" && DC up -d --force-recreate --no-deps "$svc" ); then
@@ -967,7 +1116,7 @@ patches_apply() {
   patches_write_override || return 1
 
   info "Перезапускаю бота с патчами..."
-  patches_restart || return 1
+  bot_restart || return 1
   patches_verify
 }
 
@@ -996,7 +1145,7 @@ patches_remove() {
 
   if [ "$DRY_RUN" != "1" ]; then
     info "Перезапускаю бота в штатной конфигурации..."
-    if patches_restart; then
+    if bot_restart; then
       ok "Бот работает без патчей."
     else
       warn "Проверьте состояние контейнера вручную."
@@ -1089,6 +1238,17 @@ if [ "$MODE" = "patches" ]; then
   exit 0
 fi
 
+if [ "$MODE" = "maintenance-off" ]; then
+  step "🔧 Выключение режима техработ"
+  ensure_db
+  info "Сейчас: $(maintenance_state)"
+  if maintenance_apply off && bot_restart; then
+    ok "Техработы выключены, бот работает в обычном режиме."
+    exit 0
+  fi
+  die "Не удалось выключить техработы. Проверьте админку бота."
+fi
+
 if [ "$MODE" = "menu" ]; then
   # Спрашивать некого, когда скрипт запущен из cron или с NO_CONFIRM=1 —
   # в таком режиме поведение прежнее: сразу обновление.
@@ -1150,6 +1310,11 @@ else
   confirm "Начать обновление ${CURRENT} → ${LATEST} (${#PENDING[@]} шаг(ов))?" \
     || die "Отменено пользователем."
 
+  # Техработы включаем только когда реально есть что обновлять, и до первого
+  # перезапуска контейнера — иначе пользователи успеют застать бота уже на
+  # новой схеме, но ещё без предупреждения.
+  maintenance_begin
+
   # Если поштучные бэкапы отключены (BACKUP_EVERY=0), обязательный дамп в начале
   # всё равно делаем: без него откатываться будет не на что.
   [ "${BACKUP_EVERY:-0}" -gt 0 ] || make_backup "pre_${CURRENT}_keep"
@@ -1205,6 +1370,10 @@ if [ "$LATEST" = "${ALL[-1]}" ]; then
 else
   info "Целевая версия ($LATEST) не последняя — Cabinet не трогаю."
 fi
+
+# Выключаем последним: пользователи не должны вернуться, пока не доведены и
+# патчи, и кабинет.
+maintenance_end
 
 # --------------------------------------------------- чистка неиспользуемых образов
 if [ "$PRUNE_IMAGES" = "1" ] && [ "$DRY_RUN" != "1" ]; then
