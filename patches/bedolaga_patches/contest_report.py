@@ -67,6 +67,8 @@ DEFAULT_SORT = 'paid'
 # Платёжные методы, которые не считаются реальным пополнением (ручное начисление админом).
 NON_REAL_METHODS = config.get_list('PATCH_CONTEST_REPORT_NON_REAL_METHODS', ['manual'])
 MENU_BUTTON_TEXT = config.get_str('PATCH_CONTEST_REPORT_BUTTON_TEXT', '🏆 Конкурс рефералов')
+# Кнопка админ-меню, под которую встаёт наша: «💰 Промокоды/Статистика».
+ADMIN_ANCHOR_CALLBACK = config.get_str('PATCH_CONTEST_REPORT_ANCHOR', 'admin_submenu_promo')
 # ------------------------------------------------------------------------------
 
 if DEFAULT_SCOPE not in ('period', 'all'):
@@ -193,6 +195,14 @@ def _menu_kb():
     )
 
 
+def _cancel_kb():
+    """Экранам ввода нужен выход: без него из них выбирались только текстом
+    или /start, а брошенное состояние съедало следующее сообщение админа."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text='⬅️ Отмена', callback_data='contest_report_menu')]]
+    )
+
+
 def _report_kb(active_sort):
     def mark(key, label):
         return ('✅ ' if key == active_sort else '') + label
@@ -204,6 +214,7 @@ def _report_kb(active_sort):
                 InlineKeyboardButton(text=mark('invited', '👥 Приглаш.'), callback_data='crsort:invited'),
                 InlineKeyboardButton(text=mark('revenue', '💰 Доход'), callback_data='crsort:revenue'),
             ],
+            [InlineKeyboardButton(text='📄 Выгрузить CSV', callback_data='crcsv')],
             [
                 InlineKeyboardButton(text='🎟 Билеты: оплаты', callback_data='crraffle:paid'),
                 InlineKeyboardButton(text='🎟 Билеты: приглашённые', callback_data='crraffle:invited'),
@@ -439,12 +450,8 @@ async def _generate_and_send(
         reply_markup=_report_kb(sort),
         parse_mode='HTML',
     )
-    if detail:
-        fname = f'contest_{start_utc.strftime("%Y%m%d")}_{end_utc.strftime("%Y%m%d")}.csv'
-        await target.answer_document(
-            types.BufferedInputFile(_build_csv(ranking, detail), filename=fname),
-            caption='Полный отчёт: сводка + детализация по каждому рефералу.',
-        )
+    # CSV не отправляем сам: при переборе периодов и сортировок файлы сыпались
+    # в чат пачками. Теперь он выгружается кнопкой «📄 Выгрузить CSV».
     logger.info(
         'contest_report generated',
         admin=admin_tg,
@@ -469,7 +476,14 @@ def _load_cr(data):
 
 @admin_required
 @error_handler
-async def open_menu_callback(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+async def open_menu_callback(
+    callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext
+):
+    # Состояние сбрасываем обязательно. Экраны «свой период» и «статистика
+    # пользователя» ставят FSM-состояние и ждут текст; уход отсюда кнопкой
+    # оставлял его висеть, и следующее сообщение админа в боте — любое —
+    # съедалось нашим обработчиком.
+    await state.set_state(None)
     await callback.message.edit_text(_menu_text(), reply_markup=_menu_kb(), parse_mode='HTML')
     await callback.answer()
 
@@ -503,6 +517,7 @@ async def ask_custom_callback(callback: types.CallbackQuery, db_user: User, db: 
         '✏️ Пришлите период одним сообщением:\n\n'
         '<code>ГГГГ-ММ-ДД ГГГГ-ММ-ДД</code>\nнапример: <code>2026-06-01 2026-06-30</code>\n\n'
         'Доп. параметры: <code>min=100 tz=3 top=20 scope=period</code>',
+        reply_markup=_cancel_kb(),
         parse_mode='HTML',
     )
     await callback.answer()
@@ -586,6 +601,30 @@ async def raffle_callback(callback: types.CallbackQuery, db_user: User, db: Asyn
     )
 
 
+@admin_required
+@error_handler
+async def csv_callback(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
+    cr = _load_cr(await state.get_data())
+    if not cr:
+        await callback.answer('Отчёт устарел, откройте заново', show_alert=True)
+        return
+    await callback.answer('Готовлю файл…')
+    ranking, detail = await _run_report(
+        db, cr['start_utc'], cr['end_utc'], cr['min_kopeks'], cr['scope'], cr.get('sort', DEFAULT_SORT)
+    )
+    if not detail:
+        await callback.message.answer('За этот период приглашённых нет — выгружать нечего.')
+        return
+    fname = f'contest_{cr["start_utc"].strftime("%Y%m%d")}_{cr["end_utc"].strftime("%Y%m%d")}.csv'
+    await callback.message.answer_document(
+        types.BufferedInputFile(_build_csv(ranking, detail), filename=fname),
+        caption=(
+            'Полный отчёт: сводка по реферерам + детализация по каждому рефералу.\n'
+            f'Рефереров: {len(ranking)} · строк детализации: {len(detail)}'
+        ),
+    )
+
+
 # ---------- Хендлеры: статистика пользователя --------------------------------
 
 
@@ -597,6 +636,7 @@ async def ask_userstats_callback(callback: types.CallbackQuery, db_user: User, d
         '📇 Пришлите пользователя одним сообщением:\n\n'
         '• <code>@username</code>\n• Telegram ID (число)\n\n'
         'Покажу его реферальную статистику за всё время.',
+        reply_markup=_cancel_kb(),
         parse_mode='HTML',
     )
     await callback.answer()
@@ -742,6 +782,21 @@ def _parse_command_args(raw):
 # ---------- Встраивание в бота -----------------------------------------------
 
 
+def _admin_insert_at(rows) -> int:
+    """Номер строки, на место которой встаёт кнопка конкурса.
+
+    Сразу под «Промокоды/Статистика» — отчёт по рефералам туда и просится по
+    смыслу. Ориентируемся на callback_data этой кнопки, а не на номер строки:
+    состав админ-меню между версиями бота меняется. Не нашли — дописываем
+    в конец, как раньше.
+    """
+    for index, row in enumerate(rows):
+        for button in row:
+            if getattr(button, 'callback_data', None) == ADMIN_ANCHOR_CALLBACK:
+                return index + 1
+    return len(rows)
+
+
 def _patch_admin_keyboard() -> None:
     """Добавить кнопку в клавиатуру админ-панели.
 
@@ -765,7 +820,10 @@ def _patch_admin_keyboard() -> None:
                 getattr(b, 'callback_data', None) == 'contest_report_menu' for row in rows for b in row
             )
             if not already:
-                rows.append([InlineKeyboardButton(text=MENU_BUTTON_TEXT, callback_data='contest_report_menu')])
+                rows.insert(
+                    _admin_insert_at(rows),
+                    [InlineKeyboardButton(text=MENU_BUTTON_TEXT, callback_data='contest_report_menu')],
+                )
             return InlineKeyboardMarkup(inline_keyboard=rows)
         except Exception as error:  # noqa: BLE001
             logger.warning('contest_report: не удалось дорисовать кнопку', error=str(error))
@@ -792,6 +850,7 @@ def _register_handlers(dp: Dispatcher) -> None:
     dp.callback_query.register(ask_userstats_callback, F.data == 'contest_report_userstats')
     dp.callback_query.register(resort_callback, F.data.startswith('crsort:'))
     dp.callback_query.register(raffle_callback, F.data.startswith('crraffle:'))
+    dp.callback_query.register(csv_callback, F.data == 'crcsv')
     dp.message.register(process_custom_period, ContestReportStates.waiting_period)
     dp.message.register(process_userstats, ContestReportStates.waiting_user)
     dp.message.register(cmd_contest_report, Command('contest_report'))
