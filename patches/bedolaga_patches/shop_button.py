@@ -1,15 +1,15 @@
-"""Кнопка магазина в самом низу главного меню бота.
+"""Кнопка магазина в главном меню бота.
 
-Добавляет последней строкой главного меню кнопку-ссылку (по умолчанию
-«AhriShop» → https://ahrishop.com/).
+Добавляет в главное меню кнопку-ссылку (по умолчанию «Наш магазин» →
+https://ahrishop.com/) — выше служебных строк «Админ-панель» и «Модерация»,
+а у обычного пользователя последней.
 
 Почему патч, а не штатная возможность
 -------------------------------------
 В боте есть свои кастомные кнопки главного меню (таблица `main_menu_buttons`,
 управляются через кабинет). Но в клавиатуре они вставляются в середину — перед
-промокодом, рефералами, конкурсами и поддержкой, — и «в самом низу» через них
-не получается. Патч дописывает строку уже к готовой клавиатуре, поэтому кнопка
-всегда последняя.
+промокодом, рефералами, конкурсами и поддержкой, — и нужного места через них не
+добиться. Патч вставляет строку уже в готовую клавиатуру.
 
 Как встраивается
 ----------------
@@ -37,8 +37,12 @@ __all__ = ['install']
 
 logger = structlog.get_logger('bedolaga_patches.shop_button')
 
-DEFAULT_TEXT = 'AhriShop'
+DEFAULT_TEXT = 'Наш магазин'
 DEFAULT_URL = 'https://ahrishop.com/'
+
+# Служебные строки меню: «Админ-панель» и «Модерация». Обе ветки сборки
+# клавиатуры вешают на них эти callback_data и ставят их в самый низ.
+STAFF_CALLBACKS = ('admin_panel', 'moderator_panel')
 
 
 def _text() -> str:
@@ -57,6 +61,20 @@ def _valid_url(url: str) -> bool:
     вообще. Поэтому при сомнительной ссылке кнопку просто не рисуем.
     """
     return url.startswith(('http://', 'https://')) and len(url) > len('https://')
+
+
+def _insert_at(rows) -> int:
+    """Номер строки, перед которой встаёт кнопка.
+
+    Выше служебных строк: «Админ-панель» и «Модерация» всегда идут последними,
+    и магазин под ними читался бы как часть админки. У обычного пользователя
+    таких строк нет — тогда кнопка просто последняя.
+    """
+    for index, row in enumerate(rows):
+        for button in row:
+            if getattr(button, 'callback_data', None) in STAFF_CALLBACKS:
+                return index
+    return len(rows)
 
 
 def _with_shop_button(markup):
@@ -79,7 +97,7 @@ def _with_shop_button(markup):
         if any(getattr(button, 'url', None) == url for row in rows for button in row):
             return markup
 
-        rows.append([InlineKeyboardButton(text=_text(), url=url)])
+        rows.insert(_insert_at(rows), [InlineKeyboardButton(text=_text(), url=url)])
         return InlineKeyboardMarkup(inline_keyboard=rows)
     except Exception as error:  # noqa: BLE001
         logger.warning('shop_button: клавиатура не поддалась, оставляю как есть', error=str(error))
