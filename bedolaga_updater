@@ -178,6 +178,100 @@ pick() {
   done
 }
 
+# Множественный выбор галочками.
+#   pick_multi RESULT_VAR "1101" "Пункт 1" "Пункт 2" ...
+# Второй аргумент — строка начальных состояний (по символу 0/1 на пункт).
+#   Пробел — отметить/снять, ↑/↓ (k/j) — перебор, цифра — перейти к пункту,
+#   a — отметить все, n — снять все, Enter — подтвердить, q/Esc — отмена.
+# В RESULT_VAR кладётся такая же строка 0/1, при отмене — пустая.
+pick_multi() {
+  local __var="$1" states="$2"; shift 2
+  local items=("$@") n=$# cur=0 key rest drain i mark
+
+  printf -v "$__var" '%s' ''
+  [ "$n" -gt 0 ] || return 0
+
+  # Дополняем состояния до числа пунктов, если строка короче.
+  while [ "${#states}" -lt "$n" ]; do states="${states}1"; done
+
+  _pm_set() {  # _pm_set ИНДЕКС ЗНАЧЕНИЕ
+    states="${states:0:$1}$2${states:$(($1 + 1))}"
+  }
+
+  if [ ! -r /dev/tty ] || [ ! -t 1 ] || [ "${PLAIN_MENU:-0}" = "1" ]; then
+    local ans="" num
+    for ((i = 0; i < n; i++)); do
+      [ "${states:$i:1}" = "1" ] && mark='[✓]' || mark='[ ]'
+      echo "  $((i + 1))) $mark ${items[$i]}"
+    done
+    echo
+    ask "Номера через пробел — переключить (Enter — оставить как есть): " ans
+    for num in $ans; do
+      case "$num" in
+        *[!0-9]*|0) continue ;;
+      esac
+      [ "$num" -le "$n" ] || continue
+      if [ "${states:$((num - 1)):1}" = "1" ]; then _pm_set "$((num - 1))" 0; else _pm_set "$((num - 1))" 1; fi
+    done
+    printf -v "$__var" '%s' "$states"
+    return 0
+  fi
+
+  for ((i = 0; i < n; i++)); do echo; done
+  echo
+  printf '\033[%dA\033[s%s' "$((n + 1))" "$C_HIDE"
+
+  while :; do
+    printf '\033[u\033[J'
+    for ((i = 0; i < n; i++)); do
+      [ "${states:$i:1}" = "1" ] && mark='[✓]' || mark='[ ]'
+      if [ "$i" = "$cur" ]; then
+        printf '  %s ❯ %s %s %s\n' "$C_SEL" "$mark" "${items[$i]}" "$C_RESET"
+      else
+        printf '    %s%s %s%s\n' "$C_DIM" "$mark" "${items[$i]}" "$C_RESET"
+      fi
+    done
+    printf '    %sпробел — отметить · a — все · n — ничего · Enter — готово%s\n' "$C_DIM" "$C_RESET"
+
+    IFS= read -rsn1 key < /dev/tty || { printf '%s' "$C_SHOW"; return 0; }
+    case "$key" in
+      $'\e')
+        rest=""
+        IFS= read -rsn2 -t 0.1 rest < /dev/tty
+        case "$rest" in
+          '[A'|'OA') cur=$(( (cur - 1 + n) % n )) ;;
+          '[B'|'OB') cur=$(( (cur + 1) % n )) ;;
+          '')        printf '%s' "$C_SHOW"; return 0 ;;
+          *)
+            case "${rest#?}" in
+              [a-zA-Z~]) : ;;
+              *)
+                while IFS= read -rsn1 -t 0.05 drain < /dev/tty; do
+                  case "$drain" in
+                    [a-zA-Z~]) break ;;
+                  esac
+                done
+                ;;
+            esac
+            ;;
+        esac
+        ;;
+      ' ')
+        if [ "${states:$cur:1}" = "1" ]; then _pm_set "$cur" 0; else _pm_set "$cur" 1; fi
+        ;;
+      '')  printf '%s' "$C_SHOW"; printf -v "$__var" '%s' "$states"; return 0 ;;
+      [1-9])
+        [ "$key" -le "$n" ] && cur=$((key - 1))
+        ;;
+      a|A) states=""; for ((i = 0; i < n; i++)); do states="${states}1"; done ;;
+      n|N) states=""; for ((i = 0; i < n; i++)); do states="${states}0"; done ;;
+      k|K) cur=$(( (cur - 1 + n) % n )) ;;
+      j|J) cur=$(( (cur + 1) % n )) ;;
+      q|Q) printf '%s' "$C_SHOW"; return 0 ;;
+    esac
+  done
+}
+
 # ------------------------------------------------------------------- аргументы
 # MODE=menu    — спросить, что делать (по умолчанию, если команду не назвали)
 # MODE=update  — сразу обновление (в конце патчи переустанавливаются, если стоят)
@@ -636,68 +730,61 @@ patches_print_switches() {
   return 0
 }
 
-patches_toggle_menu() {
-  step "🧩 Патчи: включение / выключение"
+patches_set_switch() {  # patches_set_switch KEY 0|1
   local env; env="$(patches_dir)/patches.env"
-  if [ ! -f "$env" ]; then
-    err "Нет $env — сначала установите патчи (пункт 1)."
+  if grep -qE "^$1=" "$env" 2>/dev/null; then
+    sed -i -E "s|^$1=.*|$1=$2|" "$env"
+  else
+    printf '%s=%s\n' "$1" "$2" >> "$env"
+  fi
+}
+
+# Спрашивает галочками, какие патчи должны работать, и записывает выключатели.
+# Возвращает 0, если что-то изменилось, и 1, если нет (в том числе при отмене),
+# — вызывающий решает, нужен ли перезапуск.
+patches_choose() {
+  local env; env="$(patches_dir)/patches.env"
+  [ -f "$env" ] || { err "Нет $env — сначала установите патчи."; return 1; }
+
+  local keys=() labels=() before="" key
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    keys+=("$key")
+    labels+=("$(patches_switch_label "$key")")
+    before="${before}$(patches_switch_state "$key")"
+  done < <(patches_switches)
+
+  if [ "${#keys[@]}" -eq 0 ]; then
+    warn "В patches.env не найдено ни одного выключателя PATCH_*_ENABLED."
     return 1
   fi
 
-  local changed=0
-  while :; do
-    local keys=() items=() key state new choice=""
-    while IFS= read -r key; do
-      [ -n "$key" ] || continue
-      keys+=("$key")
-      # Пометку рисуем текстом, а не цветом: подсветка выбранного пункта —
-      # это фон на всю строку, и вложенный сброс цвета рвал бы её посередине.
-      if [ "$(patches_switch_state "$key")" = "1" ]; then
-        items+=("[✓] $(patches_switch_label "$key")")
-      else
-        items+=("[ ] $(patches_switch_label "$key")")
-      fi
-    done < <(patches_switches)
+  local after=""
+  pick_multi after "$before" "${labels[@]}"
+  if [ -z "$after" ] || [ "$after" = "$before" ]; then
+    info "Список патчей не изменился."
+    return 1
+  fi
 
-    if [ "${#keys[@]}" -eq 0 ]; then
-      warn "В patches.env не найдено ни одного выключателя PATCH_*_ENABLED."
-      return 1
+  local i=0 value
+  for key in "${keys[@]}"; do
+    value="${after:$i:1}"
+    if [ "${before:$i:1}" != "$value" ]; then
+      patches_set_switch "$key" "$value"
+      [ "$value" = "1" ] && ok "$key включён" || ok "$key выключен"
     fi
-    items+=("Назад")
-
-    echo
-    echo "Выберите патч, чтобы переключить его. По умолчанию включено всё."
-    echo
-    pick choice "${items[@]}"
-
-    # Пусто (Esc/q/Enter в режиме без стрелок) — выходим.
-    [ -z "$choice" ] && break
-    # Со стрелками сюда приходит только корректный номер, а в режиме без них
-    # его набирают руками. Без проверки '0' уходил в $((0-1)) и молча
-    # переключал ПОСЛЕДНИЙ патч, а буквы роняли сравнение.
-    case "$choice" in
-      *[!0-9]*) warn "Нужен номер из списка."; continue ;;
-    esac
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt $(( ${#keys[@]} + 1 )) ]; then
-      warn "Нет пункта с номером $choice."
-      continue
-    fi
-    # Последний пункт списка — «Назад».
-    [ "$choice" -gt "${#keys[@]}" ] && break
-
-    key="${keys[$((choice - 1))]}"
-    state=$(patches_switch_state "$key")
-    [ "$state" = "1" ] && new=0 || new=1
-    if grep -qE "^$key=" "$env"; then
-      sed -i -E "s|^$key=.*|$key=$new|" "$env"
-    else
-      printf '%s=%s\n' "$key" "$new" >> "$env"
-    fi
-    changed=1
-    [ "$new" = "1" ] && ok "$key включён" || ok "$key выключен"
+    i=$((i + 1))
   done
+  return 0
+}
 
-  [ "$changed" = "0" ] && { info "Ничего не изменено."; return 0; }
+patches_toggle_menu() {
+  step "🧩 Патчи: включение / выключение"
+  echo
+  echo "Отметьте пробелом патчи, которые должны работать."
+  echo
+
+  patches_choose || return 0
 
   if [ "$DRY_RUN" = "1" ]; then
     echo "  [dry-run] перезапуск пропущен"
@@ -864,6 +951,19 @@ patches_apply() {
     return 0
   fi
   patches_fetch          || return 1
+
+  # Файлы скачиваются все: выбор — это выключатели в patches.env. Выключенный
+  # патч даже не импортируется, а передумать потом можно без повторной
+  # закачки. В неинтерактивном запуске не спрашиваем и оставляем как было.
+  if [ "${NO_CONFIRM:-0}" = "1" ]; then
+    info "Неинтерактивный запуск — состав патчей не спрашиваю."
+  else
+    echo
+    echo "Отметьте пробелом патчи, которые должны работать."
+    echo
+    patches_choose || true
+  fi
+
   patches_write_override || return 1
 
   info "Перезапускаю бота с патчами..."
