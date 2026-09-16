@@ -16,7 +16,7 @@
 #      контейнеры, и только потом перезапускает стек и ждёт healthcheck.
 #   7. Переустанавливает патчи (наши правки поведения бота), если они стоят.
 #   8. Если рядом с ботом есть папка cabinet и бот доведён до последней версии — обновляет её.
-#   9. Чистит неиспользуемые docker-образы и показывает, как смотреть логи.
+#   9. Освобождает место: архивирует логи, чистит кеш сборки и образы.
 #
 # Команды:
 #   bedolaga_updater            — меню: обновить бота / управлять патчами
@@ -56,6 +56,11 @@
 #   MAINTENANCE=1            — включать режим техработ на время обновления
 #                              (0 = не трогать)
 #   REDIS_CONTAINER=...      — переопределить контейнер Redis
+#   BUILD_CACHE_MAX_GB=10    — выше этого размера чистить кеш сборки docker
+#   BUILD_CACHE_KEEP_HOURS=24 — кеш свежее этого возраста не трогать
+#   LOG_MAX_MB=50            — логи крупнее уходят в архив (logs/archive)
+#   LOG_RETENTION_DAYS=30    — сколько хранить архивы логов
+#   DOCKER_LOG_MAX_MB=100    — json-логи контейнеров крупнее подрезаются
 
 set -uo pipefail
 
@@ -298,6 +303,8 @@ usage() {
                   включить/выключить, статус, удалить. Бота не обновляем.
   maintenance-off Выключить режим техработ и перезапустить бота. Нужна, если
                   обновление оборвалось и техработы остались включёнными.
+  cleanup         Освободить место: архивировать крупные логи, подрезать
+                  json-логи контейнеров, почистить кеш сборки docker.
 
 Ключи:
   --no-patches    Не трогать патчи после обновления.
@@ -315,6 +322,7 @@ while [ "$#" -gt 0 ]; do
     patches|patch)  MODE="patches" ;;
     update)         MODE="update" ;;
     maintenance-off|maint-off) MODE="maintenance-off" ;;
+    cleanup|clean) MODE="cleanup" ;;
     --no-patches)   PATCHES="0" ;;
     --patches)      PATCHES="1" ;;
     -h|--help)      usage; exit 0 ;;
@@ -590,6 +598,150 @@ maintenance_warn_if_left_on() {
   warn "ВНИМАНИЕ: режим техработ остался ВКЛЮЧЁННЫМ."
   warn "Выключите его в админке бота (Настройки → MAINTENANCE_MODE) или командой:"
   warn "  curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/bedolaga_updater | bash -s -- maintenance-off"
+}
+
+# ------------------------------------------------------------- очистка диска
+# Два источника, которые растут сами и однажды забивают диск:
+#
+#   1. Кеш сборки docker. Поэтапное обновление собирает образ НА КАЖДУЮ версию,
+#      и кеш копится прогонами. Штатный `docker image prune` его не трогает —
+#      он удаляет только висячие образы.
+#   2. logs/bot.log. Файл один, растёт без ограничений, бот держит его открытым.
+
+BUILD_CACHE_MAX_GB="${BUILD_CACHE_MAX_GB:-10}"       # выше этого — чистим кеш сборки
+BUILD_CACHE_KEEP_HOURS="${BUILD_CACHE_KEEP_HOURS:-24}"  # свежий кеш оставляем
+LOG_MAX_MB="${LOG_MAX_MB:-50}"                       # больше — в архив
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"       # сколько хранить архивы
+DOCKER_LOG_MAX_MB="${DOCKER_LOG_MAX_MB:-100}"        # json-логи контейнеров
+
+# "36.19GB (95%)" → мегабайты
+docker_size_mb() {
+  awk -v s="$1" 'BEGIN {
+    gsub(/\(.*/, "", s); gsub(/ /, "", s);
+    num = s + 0;
+    u = toupper(s); sub(/^[0-9.]+/, "", u);
+    if      (u ~ /^T/) m = num * 1024 * 1024;
+    else if (u ~ /^G/) m = num * 1024;
+    else if (u ~ /^M/) m = num;
+    else if (u ~ /^K/) m = num / 1024;
+    else               m = num / 1048576;
+    printf "%d", m;
+  }'
+}
+
+cleanup_build_cache() {
+  local raw mb limit
+  raw=$(docker system df --format '{{.Type}}|{{.Reclaimable}}' 2>/dev/null \
+        | awk -F'|' '$1 ~ /Build Cache/ { print $2 }')
+  if [ -z "$raw" ]; then
+    info "Размер кеша сборки определить не удалось — пропускаю."
+    return 0
+  fi
+
+  mb=$(docker_size_mb "$raw")
+  limit=$(( BUILD_CACHE_MAX_GB * 1024 ))
+  info "Кеш сборки docker: можно освободить ${raw} (порог ${BUILD_CACHE_MAX_GB} ГБ)"
+  if [ "$mb" -le "$limit" ]; then
+    info "Ниже порога — не трогаю."
+    return 0
+  fi
+
+  [ "$DRY_RUN" = "1" ] && { echo "  [dry-run] docker builder prune пропущен"; return 0; }
+
+  # Кеш последних суток оставляем: если обновление гоняют подряд, он экономит
+  # минуты на сборке. Всё, что старше, — от прошлых прогонов и уже бесполезно.
+  info "Чищу кеш сборки старше ${BUILD_CACHE_KEEP_HOURS}ч..."
+  if docker builder prune -f --filter "until=${BUILD_CACHE_KEEP_HOURS}h" 2>/dev/null | tail -n 2; then
+    ok "Кеш сборки почищен."
+  else
+    warn "Не удалось почистить кеш сборки (старый docker?). Вручную: docker builder prune -af"
+  fi
+}
+
+# Ротация через «скопировать и обнулить». Переименовать или удалить файл нельзя:
+# бот держит его открытым и продолжил бы писать в старый inode, а новый bot.log
+# не появился бы до перезапуска. Обнуление на месте безопасно — обработчик
+# логов Python пишет в режиме дозаписи.
+cleanup_logs() {
+  local dir="$BOT_DIR/logs" arch f size ts rotated=0 found=0
+  [ -d "$dir" ] || { info "Папки logs нет — пропускаю."; return 0; }
+
+  arch="$dir/archive"
+  mkdir -p "$arch" 2>/dev/null || true
+
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    size=$(du -m "$f" 2>/dev/null | cut -f1)
+    found=$((found + 1))
+    info "Архивирую $(basename "$f") (${size} МБ)..."
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "  [dry-run] архивация пропущена"
+      continue
+    fi
+    ts=$(date +%Y%m%d_%H%M%S)
+    if gzip -c "$f" > "$arch/$(basename "$f" .log)_$ts.log.gz" 2>/dev/null; then
+      : > "$f"
+      rotated=$((rotated + 1))
+    else
+      warn "Не удалось заархивировать $f — оставляю как есть."
+      rm -f "$arch/$(basename "$f" .log)_$ts.log.gz"
+    fi
+  done < <(find "$dir" -maxdepth 1 -type f -name '*.log' -size +"${LOG_MAX_MB}"M 2>/dev/null)
+
+  if [ "$rotated" -gt 0 ]; then
+    ok "Заархивировано логов: $rotated"
+  elif [ "$found" -eq 0 ]; then
+    info "Логов крупнее ${LOG_MAX_MB} МБ нет."
+  fi
+
+  if [ "$DRY_RUN" != "1" ] && [ "${LOG_RETENTION_DAYS:-0}" -gt 0 ]; then
+    local old
+    old=$(find "$arch" -type f \( -name '*.gz' -o -name '*.tar.gz' \) -mtime +"$LOG_RETENTION_DAYS" 2>/dev/null | wc -l)
+    if [ "$old" -gt 0 ]; then
+      find "$arch" -type f \( -name '*.gz' -o -name '*.tar.gz' \) -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null
+      ok "Удалено архивов старше ${LOG_RETENTION_DAYS} дней: $old"
+    fi
+  fi
+}
+
+# json-логи контейнеров docker не ротируются, пока это не настроено в daemon.json
+# или в compose. Раз не настроено — подрезаем сами, когда разрастаются.
+cleanup_docker_logs() {
+  local c path size limit trimmed=0
+  limit="$DOCKER_LOG_MAX_MB"
+  for c in $(docker ps -a --format '{{.Names}}' 2>/dev/null); do
+    path=$(docker inspect -f '{{.LogPath}}' "$c" 2>/dev/null)
+    [ -n "$path" ] && [ -f "$path" ] || continue
+    size=$(du -m "$path" 2>/dev/null | cut -f1)
+    [ -n "$size" ] && [ "$size" -gt "$limit" ] || continue
+    info "json-лог контейнера $c: ${size} МБ — подрезаю."
+    [ "$DRY_RUN" = "1" ] && { echo "  [dry-run] пропущено"; continue; }
+    : > "$path" && trimmed=$((trimmed + 1))
+  done
+  [ "$trimmed" -gt 0 ] && ok "Подрезано json-логов: $trimmed"
+  return 0
+}
+
+cleanup_disk() {
+  step "🧹 Очистка диска"
+  local before after
+  before=$(df -Pm "$BOT_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+
+  cleanup_logs
+  echo
+  cleanup_docker_logs
+  echo
+  cleanup_build_cache
+
+  if [ "$DRY_RUN" != "1" ]; then
+    echo
+    docker image prune -f >/dev/null 2>&1 && ok "Висячие образы удалены." \
+      || warn "Не удалось выполнить docker image prune."
+    after=$(df -Pm "$BOT_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+    if [ -n "$before" ] && [ -n "$after" ]; then
+      info "Свободно на диске: было ${before} МБ, стало ${after} МБ (+$((after - before)) МБ)"
+    fi
+  fi
 }
 
 # --------------------------------------------------------- проверка места на ФС
@@ -1222,11 +1374,12 @@ main_menu() {
     fi
     echo
     local choice=""
-    pick choice "Обновить бота" "Управление патчами" "Выход"
+    pick choice "Обновить бота" "Управление патчами" "Очистка диска" "Выход"
     case "$choice" in
       1)   return 0 ;;
       2)   patches_menu ;;
-      3|'') info "Выход."; exit 0 ;;
+      3)   cleanup_disk ;;
+      4|'') info "Выход."; exit 0 ;;
       *)   warn "Не понял ответ: $choice" ;;
     esac
   done
@@ -1235,6 +1388,11 @@ main_menu() {
 # =============================================================== основной поток
 if [ "$MODE" = "patches" ]; then
   patches_menu
+  exit 0
+fi
+
+if [ "$MODE" = "cleanup" ]; then
+  cleanup_disk
   exit 0
 fi
 
@@ -1375,14 +1533,10 @@ fi
 # патчи, и кабинет.
 maintenance_end
 
-# --------------------------------------------------- чистка неиспользуемых образов
-if [ "$PRUNE_IMAGES" = "1" ] && [ "$DRY_RUN" != "1" ]; then
-  step "🧹 Чистка неиспользуемых docker-образов"
-  before=$(docker system df --format '{{.Type}} {{.Reclaimable}}' 2>/dev/null | awk '/Images/{print $2$3}')
-  docker image prune -f >/dev/null 2>&1 && ok "Висячие (dangling) образы удалены." \
-    || warn "Не удалось выполнить docker image prune."
-  [ -n "${before:-}" ] && info "Освобождаемое место до чистки (образы): ${before}"
-  info "Для более глубокой очистки вручную: docker system prune -af (удалит ВСЕ неиспользуемые образы)."
+# ------------------------------------------------------------- очистка диска
+if [ "$PRUNE_IMAGES" = "1" ]; then
+  cleanup_disk
+  info "Если места всё равно мало: docker system prune -af (удалит ВСЕ неиспользуемые образы)."
 fi
 
 # ------------------------------------------------------------------ финал
