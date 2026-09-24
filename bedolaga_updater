@@ -56,6 +56,7 @@
 #   MAINTENANCE=1            — включать режим техработ на время обновления
 #                              (0 = не трогать)
 #   REDIS_CONTAINER=...      — переопределить контейнер Redis
+#   DOCKER_PROXY_NO_PROXY=... — что пускать мимо прокси docker
 #   BUILD_CACHE_MAX_GB=10    — выше этого размера чистить кеш сборки docker
 #   BUILD_CACHE_KEEP_HOURS=24 — кеш свежее этого возраста не трогать
 #   LOG_MAX_MB=50            — логи крупнее уходят в архив (logs/archive)
@@ -305,6 +306,8 @@ usage() {
                   обновление оборвалось и техработы остались включёнными.
   cleanup         Освободить место: архивировать крупные логи, подрезать
                   json-логи контейнеров, почистить кеш сборки docker.
+  proxy           Прокси для docker: настроить, заменить, проверить, убрать.
+                  Нужен, когда Docker Hub недоступен и сборка падает на токене.
 
 Ключи:
   --no-patches    Не трогать патчи после обновления.
@@ -323,6 +326,7 @@ while [ "$#" -gt 0 ]; do
     update)         MODE="update" ;;
     maintenance-off|maint-off) MODE="maintenance-off" ;;
     cleanup|clean) MODE="cleanup" ;;
+    proxy)         MODE="proxy" ;;
     --no-patches)   PATCHES="0" ;;
     --patches)      PATCHES="1" ;;
     -h|--help)      usage; exit 0 ;;
@@ -633,6 +637,277 @@ maintenance_warn_if_left_on() {
   warn "ВНИМАНИЕ: режим техработ остался ВКЛЮЧЁННЫМ."
   warn "Выключите его в админке бота (Настройки → MAINTENANCE_MODE) или командой:"
   warn "  curl -fsSL https://raw.githubusercontent.com/kifchandr/bedolaga_updater/main/bedolaga_updater | bash -s -- maintenance-off"
+}
+
+# --------------------------------------------------------- прокси для Docker
+# Docker Hub раздаёт токены и слои через Cloudflare, и с российских адресов эти
+# узлы часто недоступны. Сам реестр при этом отвечает, поэтому сборка падает не
+# сразу, а на невнятном «failed to fetch anonymous token ... i/o timeout».
+#
+# Лечится прокси для демона. Проксировать нужно ИМЕННО демон: сборочные шаги
+# (apt, pip) ходят в свои зеркала напрямую и в прокси не нуждаются.
+#
+# Настройки живут в systemd-дропине, потому что образы тянет dockerd, а он
+# читает прокси из своего окружения.
+
+DOCKER_PROXY_DIR="/etc/systemd/system/docker.service.d"
+DOCKER_PROXY_DROPIN="$DOCKER_PROXY_DIR/proxy.conf"
+DOCKER_PROXY_MARKER="# managed-by: bedolaga_updater"
+# ghcr.io и локальные адреса работают напрямую — гонять их через прокси только
+# медленнее.
+DOCKER_PROXY_NO_PROXY="${DOCKER_PROXY_NO_PROXY:-localhost,127.0.0.1,::1,ghcr.io,pkg-containers.githubusercontent.com}"
+
+proxy_current() {
+  [ -f "$DOCKER_PROXY_DROPIN" ] || return 1
+  sed -n 's/^Environment="HTTPS_PROXY=\(.*\)"$/\1/p' "$DOCKER_PROXY_DROPIN" | head -n1
+}
+
+proxy_is_ours() {
+  [ -f "$DOCKER_PROXY_DROPIN" ] && grep -qF "$DOCKER_PROXY_MARKER" "$DOCKER_PROXY_DROPIN"
+}
+
+# Пароль в выводе не показываем: логи запуска часто копируют в переписку.
+proxy_masked() {
+  echo "$1" | sed -E 's|://([^:/@]+):[^@]*@|://\1:***@|'
+}
+
+# Приводим адрес к тому, что понимает dockerd.
+#   socks5h:// — схема curl. Демон написан на Go, а Go суффикс «h» не понимает
+#   (golang/go#24135, до сих пор открыт) и попытается резолвить хост «socks5h».
+#   Потери нет: Go и так передаёт прокси имя хоста, DNS резолвится на его
+#   стороне — то есть ведёт себя как socks5h.
+proxy_normalize() {
+  local url; url="$(echo "$1" | tr -d '[:space:]')"
+  [ -n "$url" ] || return 1
+  case "$url" in
+    socks5h://*)
+      url="socks5://${url#socks5h://}"
+      warn "socks5h:// заменена на socks5:// — dockerd понимает только её." >&2
+      ;;
+    socks5://*|http://*|https://*) : ;;
+    *://*) err "Неподдерживаемая схема: ${url%%://*}" >&2; return 1 ;;
+    *) url="socks5://$url"; info "Схема не указана — считаю socks5://" >&2 ;;
+  esac
+  case "${url#*://}" in
+    *:[0-9]*) : ;;
+    *) err "В адресе не видно порта: $(proxy_masked "$url")" >&2; return 1 ;;
+  esac
+  echo "$url"
+}
+
+# Проверка ДО того, как трогать демон: незачем ронять контейнеры ради адреса,
+# который всё равно не работает. Спрашиваем ровно тот узел, на котором падает
+# сборка, — выдачу токена Docker Hub.
+proxy_test() {
+  local url="$1" code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 -x "$url" \
+    'https://auth.docker.io/token?scope=repository:library/hello-world:pull&service=registry.docker.io' 2>/dev/null)
+  [ "$code" = "200" ]
+}
+
+# Canary-проверка того, что видит САМ демон: хост и dockerd ходят в сеть
+# по-разному, и проверять curl'ом с хоста после настройки прокси бессмысленно.
+# hello-world весит десятки килобайт.
+registry_canary() {
+  docker pull hello-world >/dev/null 2>&1
+}
+
+# Настройки демона лежат в /etc/systemd — без root туда не записать, и узнать
+# об этом лучше до вопросов про перезапуск.
+proxy_need_root() {
+  [ "$(id -u)" = "0" ] && return 0
+  err "Нужны права root: настройки демона лежат в $DOCKER_PROXY_DIR."
+  err "Запустите скрипт от root (sudo)."
+  return 1
+}
+
+proxy_apply() {  # proxy_apply URL
+  local url="$1"
+  proxy_need_root || return 1
+  mkdir -p "$DOCKER_PROXY_DIR" || { err "Не удалось создать $DOCKER_PROXY_DIR"; return 1; }
+
+  if [ -f "$DOCKER_PROXY_DROPIN" ] && ! proxy_is_ours; then
+    warn "В $DOCKER_PROXY_DROPIN уже есть настройки, созданные не этим скриптом:"
+    sed 's/^/   │ /' "$DOCKER_PROXY_DROPIN" >&2
+    confirm "Перезаписать? (копия останется рядом)" n || { err "Оставил как есть."; return 1; }
+    cp -p "$DOCKER_PROXY_DROPIN" "$DOCKER_PROXY_DROPIN.bak-$(date +%Y%m%d_%H%M%S)"
+  fi
+
+  # В файле пароль открытым текстом — umask ставим ДО записи, иначе файл
+  # успеет секунду побыть доступным на чтение всем.
+  ( umask 077; cat > "$DOCKER_PROXY_DROPIN" <<CONF
+$DOCKER_PROXY_MARKER
+# Прокси нужен только демону: образы тянет он. Сборочные шаги (apt, pip) ходят
+# напрямую и здесь не участвуют.
+[Service]
+Environment="HTTP_PROXY=$url"
+Environment="HTTPS_PROXY=$url"
+Environment="NO_PROXY=$DOCKER_PROXY_NO_PROXY"
+CONF
+  ) || { err "Не удалось записать $DOCKER_PROXY_DROPIN"; return 1; }
+  chmod 600 "$DOCKER_PROXY_DROPIN" 2>/dev/null || true
+  ok "Настройки записаны: $DOCKER_PROXY_DROPIN"
+
+  warn "Перезапуск docker остановит ВСЕ контейнеры примерно на минуту."
+  confirm "Перезапустить docker сейчас?" || {
+    info "Настройки на месте, но применятся только после: systemctl restart docker"
+    return 0
+  }
+
+  systemctl daemon-reload || { err "systemctl daemon-reload не отработал."; return 1; }
+  info "Перезапускаю docker..."
+  systemctl restart docker || { err "Не удалось перезапустить docker."; return 1; }
+
+  local i
+  for i in $(seq 1 30); do
+    docker info >/dev/null 2>&1 && break
+    sleep 2
+  done
+  docker info >/dev/null 2>&1 || { err "Docker не поднялся после перезапуска."; return 1; }
+  ok "Docker перезапущен."
+
+  info "Проверяю, видит ли демон Docker Hub..."
+  if registry_canary; then
+    ok "Демон тянет образы через прокси."
+    docker rmi hello-world >/dev/null 2>&1 || true
+  else
+    err "Демон по-прежнему не тянет образы с Docker Hub."
+    err "Проверьте: journalctl -u docker -n 50"
+    return 1
+  fi
+
+  # Контейнеры возвращаются сами (restart: unless-stopped), но убедимся.
+  if docker ps --format '{{.Names}}' | grep -qx "$BOT_CONTAINER"; then
+    wait_healthy 300 >/dev/null 2>&1 && ok "Бот снова работает." \
+      || warn "Бот ещё поднимается — проверьте docker compose ps."
+  else
+    warn "Контейнер $BOT_CONTAINER не запустился сам — поднимите: cd \"$BOT_DIR\" && docker compose up -d"
+  fi
+}
+
+proxy_remove() {
+  if [ ! -f "$DOCKER_PROXY_DROPIN" ]; then
+    info "Прокси для Docker не настроен — удалять нечего."
+    return 0
+  fi
+  proxy_need_root || return 1
+  if ! proxy_is_ours; then
+    warn "Файл создан не этим скриптом — не трогаю: $DOCKER_PROXY_DROPIN"
+    return 1
+  fi
+  rm -f "$DOCKER_PROXY_DROPIN"
+  ok "Настройки прокси удалены."
+  warn "Перезапуск docker остановит ВСЕ контейнеры примерно на минуту."
+  confirm "Перезапустить docker, чтобы это вступило в силу?" || {
+    info "Применится после: systemctl restart docker"
+    return 0
+  }
+  systemctl daemon-reload
+  systemctl restart docker || { err "Не удалось перезапустить docker."; return 1; }
+  local i
+  for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+  ok "Docker перезапущен без прокси."
+}
+
+proxy_status() {
+  step "🔌 Прокси для Docker"
+  local cur; cur="$(proxy_current)"
+  if [ -n "$cur" ]; then
+    ok "Настроен: $(proxy_masked "$cur")"
+    proxy_is_ours || warn "Файл создан не этим скриптом."
+    echo "  файл: $DOCKER_PROXY_DROPIN"
+    echo "  мимо прокси: $(sed -n 's/^Environment="NO_PROXY=\(.*\)"$/\1/p' "$DOCKER_PROXY_DROPIN" | head -n1)"
+  else
+    warn "Не настроен."
+  fi
+
+  echo
+  info "Проверяю доступ к Docker Hub так, как его видит демон..."
+  if registry_canary; then
+    ok "Образы с Docker Hub тянутся."
+    docker rmi hello-world >/dev/null 2>&1 || true
+  else
+    err "Демон не может тянуть образы с Docker Hub — сборка обновления упадёт."
+    [ -n "$cur" ] || info "Помогает прокси: пункт «Настроить / заменить»."
+  fi
+
+  if [ -n "$cur" ]; then
+    echo
+    info "Проверяю сам прокси напрямую..."
+    proxy_test "$cur" && ok "Прокси отдаёт токен Docker Hub." \
+      || warn "Прокси не отвечает или не пускает к auth.docker.io."
+  fi
+}
+
+proxy_configure() {
+  step "🔌 Настройка прокси для Docker"
+  local cur new url
+  cur="$(proxy_current)"
+  [ -n "$cur" ] && info "Сейчас: $(proxy_masked "$cur")"
+
+  echo
+  echo "Формат: socks5://пользователь:пароль@хост:порт"
+  echo "Подойдёт и http://…  ·  socks5h:// будет приведена к socks5://"
+  echo
+  ask "Адрес прокси (Enter — отмена): " new
+  [ -n "$new" ] || { info "Отменено."; return 0; }
+
+  url="$(proxy_normalize "$new")" || return 1
+
+  info "Проверяю прокси до того, как трогать docker..."
+  if proxy_test "$url"; then
+    ok "Прокси отдаёт токен Docker Hub — то, чего не хватало сборке."
+  else
+    err "Через этот прокси токен Docker Hub получить не удалось."
+    confirm "Всё равно записать настройки?" n || { info "Отменено, docker не тронут."; return 1; }
+  fi
+
+  proxy_apply "$url"
+}
+
+proxy_menu() {
+  local choice
+  while :; do
+    step "🔌 Прокси для Docker"
+    local cur; cur="$(proxy_current)"
+    if [ -n "$cur" ]; then
+      echo "Текущий: ${C_GRN}$(proxy_masked "$cur")${C_RESET}"
+    else
+      echo "Текущий: ${C_YEL}не настроен${C_RESET}"
+    fi
+    echo
+    pick choice "Настроить / заменить" "Проверить" "Убрать прокси" "Назад"
+    case "$choice" in
+      1) proxy_configure || warn "Настроить не удалось." ;;
+      2) proxy_status ;;
+      3) proxy_remove || warn "Удалить не удалось." ;;
+      4|'') return 0 ;;
+      *) warn "Не понял ответ: $choice" ;;
+    esac
+  done
+}
+
+# Проверка перед обновлением. Раньше недоступность Docker Hub всплывала лишь на
+# сборке — невнятной ошибкой про токен, уже после бэкапа и включённых техработ.
+preflight_registry() {
+  [ "$DRY_RUN" = "1" ] && return 0
+  info "Проверяю доступ к Docker Hub (его требует сборка образа)..."
+  if registry_canary; then
+    ok "Docker Hub доступен."
+    docker rmi hello-world >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  err "Демон не может тянуть образы с Docker Hub — сборка обновления упадёт."
+  local cur; cur="$(proxy_current)"
+  if [ -n "$cur" ]; then
+    warn "Прокси настроен ($(proxy_masked "$cur")), но не помогает."
+    warn "Проверьте его: bedolaga_updater proxy"
+  else
+    warn "Обычно это блокировка Cloudflare-узлов Docker Hub для российских адресов."
+    warn "Лечится прокси для демона: bedolaga_updater proxy"
+  fi
+  confirm "Всё равно продолжить обновление?" n || die "Остановлено до бэкапа и техработ."
 }
 
 # ------------------------------------------------------------- очистка диска
@@ -1413,12 +1688,13 @@ main_menu() {
     fi
     echo
     local choice=""
-    pick choice "Обновить бота" "Управление патчами" "Очистка диска" "Выход"
+    pick choice "Обновить бота" "Управление патчами" "Очистка диска" "Прокси для Docker" "Выход"
     case "$choice" in
       1)   return 0 ;;
       2)   patches_menu ;;
       3)   cleanup_disk ;;
-      4|'') info "Выход."; exit 0 ;;
+      4)   proxy_menu ;;
+      5|'') info "Выход."; exit 0 ;;
       *)   warn "Не понял ответ: $choice" ;;
     esac
   done
@@ -1432,6 +1708,11 @@ fi
 
 if [ "$MODE" = "cleanup" ]; then
   cleanup_disk
+  exit 0
+fi
+
+if [ "$MODE" = "proxy" ]; then
+  proxy_menu
   exit 0
 fi
 
@@ -1506,6 +1787,10 @@ else
   info "Хранится последних дампов: ${BACKUP_RETENTION} (дамп до обновления помечен _keep и не ротируется)"
   confirm "Начать обновление ${CURRENT} → ${LATEST} (${#PENDING[@]} шаг(ов))?" \
     || die "Отменено пользователем."
+
+  # Доступ к Docker Hub проверяем до бэкапа и техработ: без него сборка всё
+  # равно упадёт, и незачем ради этого гонять дамп и запирать пользователей.
+  preflight_registry
 
   # Техработы включаем только когда реально есть что обновлять, и до первого
   # перезапуска контейнера — иначе пользователи успеют застать бота уже на
