@@ -92,9 +92,21 @@ step()  { echo; echo "${C_BOLD}==============================${C_RESET}";
 die()   { err "$*"; exit 1; }
 
 # Чтение ввода даже когда скрипт запущен через `curl | bash` (stdin занят пайпом)
+# `[ -r /dev/tty ]` проходит и там, где устройство открыть нельзя: при запуске
+# по ssh без -t нода на месте, а управляющего терминала у процесса нет, и
+# перенаправление падает с «No such device or address». Поэтому проверяем
+# открытием, а результат запоминаем — пробовать на каждый вопрос незачем.
+TTY_OK=""
+tty_usable() {
+  if [ -z "$TTY_OK" ]; then
+    if { exec 9</dev/tty; } 2>/dev/null; then exec 9<&-; TTY_OK=1; else TTY_OK=0; fi
+  fi
+  [ "$TTY_OK" = "1" ]
+}
+
 ask() {  # ask "Вопрос: " VARNAME
   local prompt="$1" __var="$2" __ans=""
-  if [ -r /dev/tty ]; then read -r -p "$prompt" __ans < /dev/tty
+  if tty_usable; then read -r -p "$prompt" __ans < /dev/tty
   else read -r -p "$prompt" __ans; fi
   printf -v "$__var" '%s' "$__ans"
 }
@@ -127,7 +139,7 @@ pick() {
   [ "$n" -gt 0 ] || return 0
 
   # Нет терминала (cron, пайп без tty) — спрашиваем номер, как раньше.
-  if [ ! -r /dev/tty ] || [ ! -t 1 ] || [ "${PLAIN_MENU:-0}" = "1" ]; then
+  if ! tty_usable || [ ! -t 1 ] || [ "${PLAIN_MENU:-0}" = "1" ]; then
     local ans="" idx=1
     for i in "${items[@]}"; do echo "  $idx) $i"; idx=$((idx+1)); done
     echo
@@ -210,7 +222,7 @@ pick_multi() {
     states="${states:0:$1}$2${states:$(($1 + 1))}"
   }
 
-  if [ ! -r /dev/tty ] || [ ! -t 1 ] || [ "${PLAIN_MENU:-0}" = "1" ]; then
+  if ! tty_usable || [ ! -t 1 ] || [ "${PLAIN_MENU:-0}" = "1" ]; then
     local ans="" num
     for ((i = 0; i < n; i++)); do
       [ "${states:$i:1}" = "1" ] && mark='[✓]' || mark='[ ]'
@@ -1527,8 +1539,16 @@ bot_restart() {
 # `docker restart` в нём остаются прошлые запуски, и старая удачная строка
 # выдала бы успех там, где свежий запуск упал.
 patches_verify() {
-  local logs block
-  logs=$(docker logs --tail 2000 "$BOT_CONTAINER" 2>&1 || true)
+  local logs block since
+  # Строки патчей бот печатает один раз, при старте. По `--tail N` они теряются,
+  # как только бот наговорит больше N строк, и «Показать статус» начинает
+  # врать, что патчей в логах нет. Берём ровно текущий запуск контейнера.
+  since=$(docker inspect -f '{{.State.StartedAt}}' "$BOT_CONTAINER" 2>/dev/null)
+  if [ -n "$since" ]; then
+    logs=$(docker logs --since "$since" "$BOT_CONTAINER" 2>&1 || true)
+  else
+    logs=$(docker logs --tail 2000 "$BOT_CONTAINER" 2>&1 || true)
+  fi
   # Идём по строкам патчей с конца и останавливаемся на первой же итоговой —
   # получаем блок последнего запуска.
   block=$(echo "$logs" | grep -F '[bedolaga-patches]' \
@@ -1730,7 +1750,7 @@ fi
 if [ "$MODE" = "menu" ]; then
   # Спрашивать некого, когда скрипт запущен из cron или с NO_CONFIRM=1 —
   # в таком режиме поведение прежнее: сразу обновление.
-  if [ "${NO_CONFIRM:-0}" = "1" ] || { [ ! -r /dev/tty ] && [ ! -t 0 ]; }; then
+  if [ "${NO_CONFIRM:-0}" = "1" ] || { ! tty_usable && [ ! -t 0 ]; }; then
     info "Неинтерактивный запуск — меню пропускаю, обновляю бота."
   else
     main_menu
